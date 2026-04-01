@@ -40,7 +40,8 @@ class MainWindow(QMainWindow):
         self._schema_worker: SchemaLoaderWorker | None = None
         self._transform_worker: TransformWorker | None = None
         self._file_count: int = 0
-        self._max_attempts: int = DEFAULT_MAX_ATTEMPTS
+        self._dry_run: bool = False
+        self._is_auto_retry: bool = False
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -150,6 +151,16 @@ class MainWindow(QMainWindow):
         self._worker_spin.setValue(self._default_worker_count())
         self._worker_spin.setToolTip("Number of parallel worker threads")
 
+        attempts_label = QLabel("Versuche:")
+        attempts_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+
+        self._attempts_spin = QSpinBox()
+        self._attempts_spin.setRange(1, 20)
+        self._attempts_spin.setValue(DEFAULT_MAX_ATTEMPTS)
+        self._attempts_spin.setToolTip(
+            "Anzahl Versuche pro Datei (mit Exponential Backoff) vor automatischem Retry-Batch"
+        )
+
         self._dryrun_btn = QPushButton("Dry Run")
         self._dryrun_btn.setFixedWidth(100)
         self._dryrun_btn.setToolTip(
@@ -168,6 +179,9 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(worker_label)
         layout.addWidget(self._worker_spin)
+        layout.addSpacing(12)
+        layout.addWidget(attempts_label)
+        layout.addWidget(self._attempts_spin)
         layout.addSpacing(12)
         layout.addWidget(self._dryrun_btn)
         layout.addStretch()
@@ -278,6 +292,12 @@ class MainWindow(QMainWindow):
             self._log_info("No transforms selected - nothing to do.")
             return
 
+        self._dry_run = dry_run
+        self._is_auto_retry = False
+        self._start_transform(blob_names=None)
+
+    def _start_transform(self, blob_names: list[str] | None = None) -> None:
+        """Create and start a TransformWorker. Uses stored _dry_run and UI spinner values."""
         conn = self._conn_str_edit.text().strip()
         container = self._container_edit.text().strip()
         prefix = self._prefix_edit.text().strip()
@@ -286,18 +306,27 @@ class MainWindow(QMainWindow):
         if self._newprefix_radio.isChecked():
             output_prefix = self._output_prefix_edit.text().strip() or None
 
+        col_configs = self._schema_table.get_column_configs()
         worker_count = self._worker_spin.value()
+        max_attempts = self._attempts_spin.value()
 
-        label = "[DRY RUN] " if dry_run else ""
-        self._log_info(
-            f"{label}Starting - {self._file_count} file(s), "
-            f"{len(col_configs)} transform(s), "
-            f"{worker_count} worker(s), "
-            f"{self._max_attempts} attempt(s)/file..."
-        )
+        label = "[DRY RUN] " if self._dry_run else ""
+        if blob_names is not None:
+            self._log_info(
+                f"{label}Auto-Retry-Batch – {len(blob_names)} Datei(en), "
+                f"{worker_count} Worker, {max_attempts} Versuch(e)/Datei..."
+            )
+        else:
+            self._log_info(
+                f"{label}Starting - {self._file_count} file(s), "
+                f"{len(col_configs)} transform(s), "
+                f"{worker_count} worker(s), "
+                f"{max_attempts} attempt(s)/file..."
+            )
 
+        file_count = len(blob_names) if blob_names is not None else self._file_count
         self._set_processing_state()
-        self._progress.setMaximum(self._file_count)
+        self._progress.setMaximum(file_count)
 
         self._transform_worker = TransformWorker(
             connection_string=conn,
@@ -305,11 +334,14 @@ class MainWindow(QMainWindow):
             prefix=prefix,
             col_configs=col_configs,
             output_prefix=output_prefix,
-            dry_run=dry_run,
+            dry_run=self._dry_run,
             worker_count=worker_count,
-            max_attempts=self._max_attempts,
+            max_attempts=max_attempts,
+            blob_names=blob_names,
         )
         self._transform_worker.progress.connect(self._on_transform_progress)
+        self._transform_worker.retry_batch_started.connect(self._on_retry_batch_started)
+        self._transform_worker.workers_reduced.connect(self._on_workers_reduced)
         self._transform_worker.file_error.connect(self._on_file_error)
         self._transform_worker.finished.connect(self._on_transform_finished)
         self._transform_worker.cancelled.connect(self._on_transform_cancelled)
@@ -328,6 +360,8 @@ class MainWindow(QMainWindow):
         blob_name: str,
         duration_ms: float,
         worker_id: int,
+        skipped: bool,
+        note: str,
     ) -> None:
         self._progress.setValue(completed)
         self._status_label.setText(f"{completed} / {total} files")
@@ -335,9 +369,15 @@ class MainWindow(QMainWindow):
         current_str = str(completed).zfill(width)
         total_str = str(total).zfill(width)
         seconds = duration_ms / 1000.0
-        self._log_info(
-            f"Worker #{worker_id} | {current_str}/{total_str} | {blob_name} | {seconds:.2f} s"
+        base = (
+            f"Worker #{worker_id} | {current_str}/{total_str} | "
+            f"{blob_name} | {seconds:.2f} s"
         )
+        if skipped:
+            reason = note or "already in target schema"
+            self._log_info(f"{base} | SKIPPED ({reason})")
+        else:
+            self._log_info(base)
 
     def _on_file_error(self, blob_name: str, tb: str) -> None:
         self._log_error(f"  FAILED: {blob_name}\n{tb.strip()}")
@@ -348,6 +388,7 @@ class MainWindow(QMainWindow):
         failed: int,
         total_seconds: float,
         avg_seconds: float,
+        failed_blobs: list,
     ) -> None:
         self._set_schema_loaded_state()
         msg = (
@@ -361,10 +402,37 @@ class MainWindow(QMainWindow):
         self._log_info(msg)
         self._status_label.setText(msg)
 
+        if failed > 0 and not self._is_auto_retry:
+            self._is_auto_retry = True
+            self._log_info(
+                f"Starte automatischen Retry-Batch für {failed} fehlgeschlagene Datei(en)..."
+            )
+            self._start_transform(blob_names=list(failed_blobs))
+        elif failed > 0:
+            # Auto-retry also had failures – report and stop
+            self._is_auto_retry = False
+            self._log_error(
+                f"{failed} Datei(en) auch nach automatischem Retry nicht erfolgreich."
+            )
+        else:
+            self._is_auto_retry = False
+
     def _on_transform_cancelled(self) -> None:
+        self._is_auto_retry = False
         self._set_schema_loaded_state()
         self._log_info("Cancelled by user.")
         self._status_label.setText("Cancelled")
+
+    def _on_retry_batch_started(self, attempt: int, remaining: int, delay: int) -> None:
+        self._log_info(
+            f"Retry-Pass {attempt}/{self._attempts_spin.value()} – "
+            f"{remaining} Datei(en), warte {delay}s (Exponential Backoff)..."
+        )
+
+    def _on_workers_reduced(self, new_count: int, conn_errors: int) -> None:
+        self._log_info(
+            f"Worker auf {new_count} reduziert ({conn_errors} Verbindungsfehler in diesem Pass)."
+        )
 
     # ------------------------------------------------------------------
     # Logging helpers

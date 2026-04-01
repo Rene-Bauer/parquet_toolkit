@@ -38,10 +38,10 @@ class BlobStorageClient:
     # Download
     # ------------------------------------------------------------------
 
-    def download_bytes(self, blob_name: str) -> bytes:
+    def download_bytes(self, blob_name: str, timeout: int = 60) -> bytes:
         """Download a blob to memory and return its raw bytes."""
         blob_client = self._container.get_blob_client(blob_name)
-        downloader = blob_client.download_blob()
+        downloader = blob_client.download_blob(timeout=timeout)
         return downloader.readall()
 
     def read_schema(self, blob_name: str) -> pa.Schema:
@@ -62,7 +62,8 @@ class BlobStorageClient:
         blob_name: str,
         data: bytes,
         overwrite: bool = True,
+        timeout: int = 60,
     ) -> None:
         """Upload raw bytes to a blob, overwriting by default."""
         blob_client = self._container.get_blob_client(blob_name)
-        blob_client.upload_blob(data, overwrite=overwrite)
+        blob_client.upload_blob(data, overwrite=overwrite, timeout=timeout)

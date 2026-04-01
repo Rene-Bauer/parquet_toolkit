@@ -16,7 +16,8 @@ Built to solve a specific Databricks Autoloader compatibility problem: Parquet f
 - **In-place or new prefix** - overwrite source files or write to a different prefix
 - **Configurable worker pool** - choose how many files are processed in parallel (default = local CPU cores, capped at 32)
 - **Per-file timing & full-path logging** - see worker ID, complete blob path, and duration for every file plus a summary of totals
-- **Automatic retries** - each file is attempted up to 5 times before being marked as failed
+- **Schema-aware skip** - files that already match the selected target schema are detected early, skipped, and logged (no redundant uploads or retries)
+- **Automatic retries** - failures are reprocessed in dedicated retry batches (up to 5 total attempts) instead of hammering the same file inline
 - **Cancellable** - stop processing after the current file finishes
 - **Extensible** - add a new transform by writing one decorated Python function; it appears in all dropdowns automatically
 
@@ -93,6 +94,8 @@ Under **Output**, select one of:
 
 Use the **Workers** spinner in the action row to pick how many parallel worker threads should run (default = `min(32, cpu cores)`). Each worker downloads, transforms, and uploads its own file stream. The spinner value can be changed between runs without restarting the app. Every file is attempted up to **5 times** automatically; transient failures are logged as "will retry" before the final error is reported.
 
+During the first sweep each file runs exactly once. Any failures are collected and retried in a dedicated bulk batch (attempt #2), and so on until everything succeeds or the attempt limit is reached. Files that already match the requested output schema are detected immediately, logged as `SKIPPED`, and omitted from all retry batches.
+
 ### Step 5 - Dry run (recommended first)
 
 Click **Dry Run** to simulate the transformation. The log shows which files would be processed and which transforms would be applied - no files are uploaded.
@@ -105,7 +108,7 @@ Click **Cancel** to stop after the current file finishes.
 
 ### Logging & timing
 
-Per-file log lines include the worker ID, full blob path, progress counter, and the time spent on that file (in seconds). At the end of a run the app reports the total wall-clock time as well as the average seconds per file so you can benchmark different worker settings.
+Per-file log lines include the worker ID, full blob path, progress counter, and the time spent on that file (in seconds). Already-compliant files are annotated with `SKIPPED (already in target schema)` so you can confirm they were left untouched. When retry batches begin you'll also see `Retry batch X/Y - N file(s) queued` before the next sweep starts. At the end of a run the app reports the total wall-clock time as well as the average seconds per file so you can benchmark different worker settings.
 
 ---
 
