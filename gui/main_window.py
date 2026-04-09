@@ -244,6 +244,15 @@ class MainWindow(QMainWindow):
         self._dryrun_btn.setToolTip("Simulate the transformation — no files will be uploaded")
         self._dryrun_btn.clicked.connect(lambda: self._on_apply(dry_run=True))
 
+        self._failed_btn = QPushButton("Process Failed Files")
+        self._failed_btn.setFixedWidth(160)
+        self._failed_btn.setToolTip(
+            "Retry all files that failed in previous runs for this prefix.\n"
+            "Successfully processed files are removed from the failed list."
+        )
+        self._failed_btn.setEnabled(False)
+        self._failed_btn.clicked.connect(self._on_process_failed)
+
         self._apply_btn = QPushButton("Apply to All Files")
         self._apply_btn.setFixedWidth(150)
         self._apply_btn.clicked.connect(lambda: self._on_apply(dry_run=False))
@@ -267,6 +276,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._attempts_spin)
         layout.addSpacing(12)
         layout.addWidget(self._dryrun_btn)
+        layout.addWidget(self._failed_btn)
         layout.addStretch()
         layout.addWidget(self._apply_btn)
         layout.addWidget(self._pause_btn)
@@ -357,6 +367,7 @@ class MainWindow(QMainWindow):
         self._load_btn.setEnabled(True)
         self._dryrun_btn.setEnabled(False)
         self._apply_btn.setEnabled(False)
+        self._failed_btn.setEnabled(False)
         self._pause_btn.setEnabled(False)
         self._cancel_btn.setEnabled(False)
         self._progress.setVisible(False)
@@ -372,6 +383,7 @@ class MainWindow(QMainWindow):
         self._load_btn.setEnabled(True)
         self._dryrun_btn.setEnabled(True)
         self._apply_btn.setEnabled(True)
+        self._failed_btn.setEnabled(True)
         self._pause_btn.setEnabled(False)
         self._pause_btn.setText("Pause")
         self._cancel_btn.setEnabled(False)
@@ -383,6 +395,7 @@ class MainWindow(QMainWindow):
         self._load_btn.setEnabled(False)
         self._dryrun_btn.setEnabled(False)
         self._apply_btn.setEnabled(False)
+        self._failed_btn.setEnabled(False)
         self._pause_btn.setEnabled(True)
         self._pause_btn.setText("Pause")
         self._cancel_btn.setEnabled(True)
@@ -490,9 +503,64 @@ class MainWindow(QMainWindow):
         self._set_schema_loaded_state()
         self._dryrun_btn.setEnabled(False)
         self._apply_btn.setEnabled(False)
+        self._failed_btn.setEnabled(False)
         self._load_btn.setEnabled(True)
         self._log_error(f"Failed to load schema:\n{msg}")
         self._status_label.setText("Error — see log")
+
+    def _on_process_failed(self) -> None:
+        """Retry all files in the FailedList for the current container+prefix."""
+        container = self._container_edit.text().strip()
+        prefix = self._prefix_edit.text().strip()
+
+        col_configs = self._schema_table.get_column_configs()
+        if not col_configs:
+            self._log_info("[Failed List] No transforms selected — nothing to do.")
+            return
+
+        try:
+            fl = FailedList.load_or_create(container, prefix)
+        except RuntimeError as exc:
+            QMessageBox.critical(self, "Corrupt Failed List", str(exc))
+            return
+
+        if not fl.entries:
+            self._log_info("[Failed List] No failed files recorded for this prefix.")
+            return
+
+        entries = fl.entries
+        lines = [f"  \u2022 {e['name']}  ({e['type']})" for e in entries[:10]]
+        if len(entries) > 10:
+            lines.append(f"  ... and {len(entries) - 10} more")
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Process Failed Files")
+        msg.setText(
+            f"{len(entries)} file(s) failed in previous run(s):\n\n"
+            + "\n".join(lines)
+            + "\n\nProcess them now using the current transforms?"
+        )
+        process_btn = msg.addButton("Process", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+
+        if msg.clickedButton() != process_btn:
+            return
+
+        self._log_info(f"[Failed List] Processing {len(entries)} failed file(s)...")
+        self._dry_run = False
+        self._retry_depth = 0
+        self._corrupted_blobs = []
+        self._pending_prefixes = []
+        self._run_start_time = perf_counter()
+        self._bytes_processed = 0
+        self._files_completed_in_run = 0
+        self._total_files_in_run = len(entries)
+
+        self._start_transform(
+            blob_names=fl.blob_names(),
+            failed_list=fl,
+        )
 
     def _on_apply(self, dry_run: bool) -> None:
         col_configs = self._schema_table.get_column_configs()
