@@ -9,6 +9,8 @@ Both write atomically via temp-file + os.replace to survive crashes.
 """
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import os
 import re
@@ -21,10 +23,12 @@ _CHECKPOINTS_DIR: Path = Path(__file__).parent.parent / "checkpoints"
 
 
 def _sanitize_key(container: str, prefix: str) -> str:
-    """Build a filesystem-safe key: container__prefix (special chars → _)."""
+    """Build a filesystem-safe key with a hash suffix to prevent collisions."""
+    raw = f"{container}/{prefix}"
+    digest = hashlib.sha1(raw.encode()).hexdigest()[:8]
     c = re.sub(r"[^a-zA-Z0-9]", "_", container)
     p = re.sub(r"[^a-zA-Z0-9]", "_", prefix)
-    return f"{c}__{p}"
+    return f"{c}__{p}__{digest}"
 
 
 def _atomic_write(path: Path, data: dict) -> None:
@@ -70,11 +74,22 @@ class RunCheckpoint:
         prefix: str,
         output_prefix: str | None,
     ) -> "RunCheckpoint":
-        """Load an existing checkpoint or create a fresh in_progress one."""
+        """Load an existing checkpoint or create a fresh in_progress one.
+
+        Note: when creating a new checkpoint (no file on disk), the file is not
+        written until the first call to advance_cursor() or mark_complete(). Use
+        checkpoint_path(...).exists() only after at least one blob has been processed.
+        """
         path = RunCheckpoint.checkpoint_path(container, prefix)
         if path.exists():
             with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"Checkpoint file is corrupt and cannot be loaded: {path}\n"
+                        f"Delete the file to start fresh. Detail: {exc}"
+                    ) from exc
         else:
             now = _now()
             data = {
@@ -92,7 +107,7 @@ class RunCheckpoint:
         """True when the run finished without cancellation."""
         return self._data.get("status") == "complete"
 
-    def should_skip(self, blob_name: str, all_blobs: list[str]) -> bool:
+    def should_skip(self, blob_name: str) -> bool:
         """True if *blob_name* is at or before the cursor in the sorted listing."""
         cursor = self._data.get("cursor")
         if cursor is None:
@@ -153,11 +168,22 @@ class FailedList:
 
     @staticmethod
     def load_or_create(container: str, prefix: str) -> "FailedList":
-        """Load an existing failed list or create an empty one."""
+        """Load an existing failed list or create an empty one.
+
+        Note: when creating a new failed list (no file on disk), the file is not
+        written until the first call to add_or_update(). Use
+        failed_list_path(...).exists() only after at least one failure has been recorded.
+        """
         path = FailedList.failed_list_path(container, prefix)
         if path.exists():
             with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"Checkpoint file is corrupt and cannot be loaded: {path}\n"
+                        f"Delete the file to start fresh. Detail: {exc}"
+                    ) from exc
         else:
             now = _now()
             data = {
@@ -171,8 +197,8 @@ class FailedList:
 
     @property
     def entries(self) -> list[dict]:
-        """Snapshot of all failed entries."""
-        return list(self._data["entries"])
+        """Snapshot of all failed entries (deep copy — safe to read while writers run)."""
+        return copy.deepcopy(self._data["entries"])
 
     @property
     def corrupt_count(self) -> int:
@@ -186,20 +212,20 @@ class FailedList:
         """All failed blob names — use to re-add to a blob list for retry."""
         return [e["name"] for e in self._data["entries"]]
 
-    def add_or_update(self, blob_name: str, type: str, reason: str) -> None:
+    def add_or_update(self, blob_name: str, failure_type: str, reason: str) -> None:
         """Record a failure. Updates an existing entry if the blob already failed."""
         with self._lock:
             entries = self._data["entries"]
             for entry in entries:
                 if entry["name"] == blob_name:
-                    entry["type"] = type
+                    entry["type"] = failure_type
                     entry["reason"] = reason
                     entry["failed_at"] = _now()
                     break
             else:
                 entries.append({
                     "name": blob_name,
-                    "type": type,
+                    "type": failure_type,
                     "reason": reason,
                     "failed_at": _now(),
                 })

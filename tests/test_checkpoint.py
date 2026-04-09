@@ -67,22 +67,19 @@ class TestRunCheckpointLoadOrCreate:
 class TestRunCheckpointShouldSkip:
     def test_no_cursor_skips_nothing(self, checkpoint_dir):
         cp = RunCheckpoint.load_or_create("c", "p/", None)
-        blobs = ["p/a.parquet", "p/b.parquet", "p/c.parquet"]
-        assert not cp.should_skip("p/a.parquet", blobs)
+        assert not cp.should_skip("p/a.parquet")
 
     def test_skips_blobs_at_or_before_cursor(self, checkpoint_dir):
         cp = RunCheckpoint.load_or_create("c", "p/", None)
         cp.advance_cursor("p/b.parquet")
-        blobs = ["p/a.parquet", "p/b.parquet", "p/c.parquet"]
-        assert cp.should_skip("p/a.parquet", blobs)
-        assert cp.should_skip("p/b.parquet", blobs)
-        assert not cp.should_skip("p/c.parquet", blobs)
+        assert cp.should_skip("p/a.parquet")
+        assert cp.should_skip("p/b.parquet")
+        assert not cp.should_skip("p/c.parquet")
 
     def test_does_not_skip_blobs_after_cursor(self, checkpoint_dir):
         cp = RunCheckpoint.load_or_create("c", "p/", None)
         cp.advance_cursor("p/2026/03/01/part-0010.parquet")
-        blobs = ["p/2026/03/01/part-0010.parquet", "p/2026/03/02/part-0001.parquet"]
-        assert not cp.should_skip("p/2026/03/02/part-0001.parquet", blobs)
+        assert not cp.should_skip("p/2026/03/02/part-0001.parquet")
 
 
 class TestRunCheckpointAdvanceCursor:
