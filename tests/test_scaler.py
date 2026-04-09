@@ -81,11 +81,12 @@ def test_scale_down_does_not_trigger_on_throughput_drop_alone():
 
 
 def test_scale_down_never_goes_below_1():
-    scaler = _make_scaler(min_samples=10, window_size=100, down_error_rate=0.15, down_throughput_drop=0.30)
-    _fill_scaler_with_good_uploads(scaler, 40, bytes_=5_000_000, seconds=5.0)
-    for _ in range(10):
+    scaler = _make_scaler(min_samples=10, window_size=100,
+                          down_error_rate=0.15, down_throughput_drop=0.30)
+    _fill_scaler_with_good_uploads(scaler, 35, bytes_=5_000_000, seconds=5.0)
+    for _ in range(13):                             # 13/81 = 16%, above threshold
         scaler.record_upload(0, 0.0, False)
-    for _ in range(40):
-        scaler.record_upload(100_000, 5.0, True)
+    for _ in range(33):
+        scaler.record_upload(100_000, 5.0, True)    # 20 KB/s — well below 70% of baseline
     new_count, _ = scaler.should_scale(1, 10_000_000)
     assert new_count == 1

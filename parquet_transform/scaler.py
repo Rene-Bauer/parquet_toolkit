@@ -85,8 +85,9 @@ class AdaptiveScaler:
             if full_median > 0 and recent_median < full_median * (1 - self._down_throughput_drop):
                 self._consecutive_headroom_checks = 0
                 self._first_scale_done = True
+                actual_drop = (full_median - recent_median) / full_median
                 return max(1, current_workers - 1), (
-                    f"Fehlerrate {error_rate:.0%}, Throughput -{self._down_throughput_drop:.0%}"
+                    f"error rate {error_rate:.0%}, throughput drop {actual_drop:.0%}"
                 )
 
         return current_workers, ""  # scale-up added in Task 3
