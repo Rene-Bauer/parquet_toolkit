@@ -32,3 +32,6 @@ Thumbs.db
 
 # Git worktrees
 .worktrees/
+
+# Local run checkpoints (contain blob paths, not for version control)
+checkpoints/
