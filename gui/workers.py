@@ -280,11 +280,9 @@ class TransformWorker(QThread):
             extra = [n for n in failed_names if n not in existing]
             blob_names = extra + blob_names
             if extra:
+                type_map = {e["name"]: e["type"] for e in self._failed_list.entries}
                 for name in extra:
-                    entry_type = next(
-                        (e["type"] for e in self._failed_list.entries if e["name"] == name),
-                        "unknown",
-                    )
+                    entry_type = type_map.get(name, "unknown")
                     self.file_error.emit(
                         "(checkpoint)",
                         f"[Failed List] Retrying previously failed file: {name} ({entry_type})"
@@ -546,7 +544,7 @@ class TransformWorker(QThread):
             self.cancelled.emit()
             return
 
-        if self._checkpoint and not self._cancel_event.is_set():
+        if self._checkpoint:
             self._checkpoint.mark_complete()
             self.file_error.emit("(checkpoint)", "[Checkpoint] Run marked as complete")
 
