@@ -20,6 +20,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from parquet_transform.checkpoint import FailedList, RunCheckpoint
 from parquet_transform.processor import ColumnConfig, apply_transforms, compute_output_name
+from parquet_transform.scaler import AdaptiveScaler
 from parquet_transform.storage import BlobStorageClient
 
 try:
@@ -55,18 +56,29 @@ CONNECTION_ERROR_THROTTLE_RATIO: float = 0.1
 """If this fraction of files in a pass fail with connection errors, halve the
 worker count.  0.1 = trigger at 10 %+ error rate."""
 
-UPLOAD_BANDWIDTH_FALLBACK_KBYTES_S: int = 350
-"""Fallback bandwidth assumption (KB/s) used when calibration has no large-file
-data to measure from (e.g. all files in the calibration batch were tiny).
-350 KB/s is a conservative estimate for a typical business connection to Azure."""
+SCALER_WINDOW_SIZE: int = 100
+"""Rolling window size — number of upload measurements kept."""
 
-_CALIB_BATCH_SIZE: int = 4
-"""Number of files processed in the calibration pass before scaling workers."""
+SCALER_MIN_SAMPLES: int = 50
+"""Minimum measurements collected before any scaling decision is made."""
 
-_CALIB_LARGE_FILE_THRESHOLD_MB: int = 8
-"""Only trigger the calibration phase when the p95 file size exceeds this value.
-Below this threshold the uploads are fast enough that timeouts are unlikely even
-with many workers, so calibration overhead is not worth the cost."""
+SCALER_CHECK_INTERVAL: int = 150
+"""Number of successfully completed files between scaling checks."""
+
+SCALER_DOWN_ERROR_RATE: float = 0.15
+"""Scale-down trigger: error rate threshold (fraction, e.g. 0.15 = 15%)."""
+
+SCALER_DOWN_THROUGHPUT_DROP: float = 0.30
+"""Scale-down trigger: recent throughput must be this far below window median."""
+
+SCALER_UP_MIN_HEADROOM: int = 2
+"""Scale-up trigger: minimum headroom slots required to consider scaling up."""
+
+SCALER_UP_CONFIRM_CHECKS: int = 2
+"""Scale-up trigger: headroom must be stable for this many consecutive checks."""
+
+SCALER_UP_MAX_STEP: int = 4
+"""Scale-up: maximum workers added per incremental check."""
 
 
 _EXPECTED_OUTPUT_TYPES: dict[str, pa.DataType] = {
@@ -160,20 +172,17 @@ class TransformWorker(QThread):
 
     Adaptive concurrency
     --------------------
-    When the p95 file size exceeds _CALIB_LARGE_FILE_THRESHOLD_MB, the worker
-    automatically runs a short calibration pass (first _CALIB_BATCH_SIZE files
-    with 2 threads) and measures real upload throughput.  From that measurement
-    it derives how many threads can upload concurrently without starving each
-    other's TCP connections and hitting OS-level write timeouts.  The thread
-    pool for the main run is then set to that calibrated value — so the thread
-    count scales automatically with the available bandwidth:
+    When autoscale=True, an AdaptiveScaler continuously monitors upload
+    throughput and error rate.  Every SCALER_CHECK_INTERVAL successfully
+    completed files it may scale the worker count up or down based on:
 
-        max_workers = (measured_total_bw × UPLOAD_TIMEOUT_S / p95_bytes) × 0.7
+    - Scale down: recent error rate exceeds SCALER_DOWN_ERROR_RATE, or recent
+      throughput drops more than SCALER_DOWN_THROUGHPUT_DROP below the window
+      median.
+    - Scale up: available headroom (configured_max − current) is at least
+      SCALER_UP_MIN_HEADROOM for SCALER_UP_CONFIRM_CHECKS consecutive checks.
 
-    Examples:
-        300 KB/s  → ~3 workers   (home connection, 23 MB files)
-        1   MB/s  → ~9 workers   (office)
-        5   MB/s  → 32 workers   (datacenter / fast link)
+    Changes are announced via the ``workers_scaled`` signal.
     """
 
     progress = pyqtSignal(int, int, str, float, int, bool, str, int)
@@ -186,8 +195,9 @@ class TransformWorker(QThread):
     cancelled = pyqtSignal()
     paused_signal = pyqtSignal()
     resumed_signal = pyqtSignal()
-    # Emitted after calibration: (calibrated_worker_count, measured_bandwidth_kbs)
-    workers_calibrated = pyqtSignal(int, int)
+    workers_scaled = pyqtSignal(int, int, str, str)
+    # (new_count, old_count, direction, reason)
+    # direction: "up" | "down"
     log_message = pyqtSignal(str)
 
     def __init__(
@@ -295,7 +305,7 @@ class TransformWorker(QThread):
             return
 
         # ------------------------------------------------------------------
-        # Determine p95 file size to decide if calibration is needed
+        # Determine p95 file size (used by scaler)
         # ------------------------------------------------------------------
         p95_bytes = 0
         if blob_sizes:
@@ -304,16 +314,8 @@ class TransformWorker(QThread):
                 p95_idx = max(0, int(len(sorted_sizes) * 0.95) - 1)
                 p95_bytes = sorted_sizes[p95_idx]
 
-        needs_calibration = (
-            self._autoscale
-            and p95_bytes >= _CALIB_LARGE_FILE_THRESHOLD_MB * 1024 * 1024
-            and not self._dry_run
-            and total >= _CALIB_BATCH_SIZE
-            and self._worker_count > 2
-        )
-
         # ------------------------------------------------------------------
-        # Shared counters (used by both calibration and main pass)
+        # Shared counters
         # ------------------------------------------------------------------
         stats_lock = threading.Lock()
         processed       = 0
@@ -326,13 +328,26 @@ class TransformWorker(QThread):
         duration_tracker: dict[str, float] = {}
         retriable_failed_names: list[str] = []
 
-        # Upload timing for calibration (bytes, upload_seconds per successful upload)
-        upload_measurements: list[tuple[int, float]] = []
-        upload_meas_lock = threading.Lock()
+        # Adaptive scaler (only active when autoscale=True and not a dry run)
+        scaler: AdaptiveScaler | None = None
+        completed_since_check: int = 0
+        if self._autoscale and not self._dry_run:
+            scaler = AdaptiveScaler(
+                window_size=SCALER_WINDOW_SIZE,
+                min_samples=SCALER_MIN_SAMPLES,
+                upload_timeout_s=UPLOAD_TIMEOUT_S,
+                down_error_rate=SCALER_DOWN_ERROR_RATE,
+                down_throughput_drop=SCALER_DOWN_THROUGHPUT_DROP,
+                up_min_headroom=SCALER_UP_MIN_HEADROOM,
+                up_confirm_checks=SCALER_UP_CONFIRM_CHECKS,
+                up_max_step=SCALER_UP_MAX_STEP,
+                configured_max_workers=self._worker_count,
+            )
 
         def finalize_success(*, blob_name, worker_id, attempts, duration_ms,
                              skipped, note, size_bytes):
-            nonlocal processed, completed, total_duration_ms
+            nonlocal processed, completed, total_duration_ms, completed_since_check
+            do_scale_check = False
             with stats_lock:
                 processed += 1
                 completed += 1
@@ -342,6 +357,20 @@ class TransformWorker(QThread):
                     self._checkpoint.advance_cursor(blob_name)
                 if self._failed_list:
                     self._failed_list.remove(blob_name)
+                if scaler is not None and not skipped:
+                    completed_since_check += 1
+                    if completed_since_check >= SCALER_CHECK_INTERVAL:
+                        completed_since_check = 0
+                        do_scale_check = True
+
+            if do_scale_check:
+                old_count = self._worker_count
+                new_count, reason = scaler.should_scale(old_count, p95_bytes)
+                if new_count != old_count:
+                    self._worker_count = new_count
+                    direction = "up" if new_count > old_count else "down"
+                    self.workers_scaled.emit(new_count, old_count, direction, reason)
+
             self.progress.emit(completed_so_far, total, blob_name,
                                duration_ms, worker_id, skipped, note, size_bytes)
 
@@ -409,12 +438,12 @@ class TransformWorker(QThread):
                     )
                     aggregated_duration = duration_tracker[blob_name]
 
-                    # Collect upload timing for calibration
-                    if result.upload_bytes > 0 and result.upload_seconds > 0:
-                        with upload_meas_lock:
-                            upload_measurements.append(
-                                (result.upload_bytes, result.upload_seconds)
-                            )
+                    # Feed upload measurement to scaler
+                    if scaler is not None:
+                        if result.upload_bytes > 0 and result.upload_seconds > 0:
+                            scaler.record_upload(result.upload_bytes, result.upload_seconds, True)
+                        elif result.status == "error":
+                            scaler.record_upload(0, 0.0, False)
 
                     if result.status in {"success", "skipped"}:
                         finalize_success(
@@ -471,49 +500,7 @@ class TransformWorker(QThread):
                 t.join()
             return next_round, conn_error_count
 
-        # ------------------------------------------------------------------
-        # Calibration pass (only for large files, skipped on retry batches)
-        # ------------------------------------------------------------------
         remaining = list(blob_names)
-
-        if needs_calibration:
-            target_worker_count = self._worker_count
-            self._worker_count = 2  # conservative start
-
-            calib_batch = remaining[:_CALIB_BATCH_SIZE]
-            remaining   = remaining[_CALIB_BATCH_SIZE:]
-
-            # Pass number 0 = calibration; failures go back into remaining
-            calib_failed, _ = run_pass(calib_batch, pass_number=0)
-            remaining = calib_failed + remaining
-
-            # Compute calibrated worker count from measured upload times.
-            #
-            # With C concurrent workers each uploading simultaneously, the
-            # observed per-connection throughput is:
-            #   per_conn_bw = total_bytes / total_connection_seconds
-            #
-            # Total link bandwidth ≈ per_conn_bw × C (TCP fair-share assumption).
-            # Maximum safe workers = total_bw × UPLOAD_TIMEOUT_S / p95_bytes × safety.
-            new_worker_count = target_worker_count  # default: no change
-            measured_bw_kbs  = 0
-
-            with upload_meas_lock:
-                measurements = list(upload_measurements)
-
-            if measurements:
-                total_upload_bytes = sum(b for b, _ in measurements)
-                total_conn_secs    = sum(t for _, t in measurements)
-                if total_conn_secs > 0:
-                    per_conn_bw = total_upload_bytes / total_conn_secs  # bytes/s per slot
-                    total_bw    = per_conn_bw * 2  # calibrated with 2 workers
-                    measured_bw_kbs = int(total_bw / 1024)
-
-                    raw = total_bw * UPLOAD_TIMEOUT_S / p95_bytes * 0.7
-                    new_worker_count = max(2, min(target_worker_count, int(raw)))
-
-            self._worker_count = new_worker_count
-            self.workers_calibrated.emit(new_worker_count, measured_bw_kbs)
 
         # ------------------------------------------------------------------
         # Multi-pass retry loop with exponential back-off
