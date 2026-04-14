@@ -12,9 +12,13 @@ import uuid
 from typing import Callable
 
 import pyarrow as pa
+from pyarrow import types as pa_types
 
 
 TransformFn = Callable[[pa.Array, dict], pa.Array]
+
+_UUID_STRING_TYPE = pa.string()
+_TIMESTAMP_MS_UTC_TYPE = pa.timestamp("ms", tz="UTC")
 
 _REGISTRY: dict[str, tuple[TransformFn, str, list[str] | None]] = {}
 # key -> (fn, display_name, applicable_type_strings or None=all)
@@ -82,6 +86,17 @@ def binary16_to_uuid(array: pa.Array, params: dict) -> pa.Array:
     Parquet encoding: BYTE_ARRAY with STRING/UTF8 logical annotation
     Spark type: StringType — natively readable by Databricks Autoloader.
     """
+    arr_type = array.type
+    if pa_types.is_string(arr_type):
+        return array
+    if pa_types.is_large_string(arr_type):
+        return array.cast(_UUID_STRING_TYPE, safe=False)
+    if not (pa_types.is_fixed_size_binary(arr_type) and arr_type.byte_width == 16):
+        raise ValueError(
+            "binary16_to_uuid expects fixed_size_binary[16] or string-like input; "
+            f"got {arr_type}"
+        )
+
     results: list[str | None] = []
     for item in array:
         if item is None or item.as_py() is None:
@@ -89,7 +104,7 @@ def binary16_to_uuid(array: pa.Array, params: dict) -> pa.Array:
         else:
             raw: bytes = item.as_py()
             results.append(str(uuid.UUID(bytes=raw)))
-    return pa.array(results, type=pa.string())
+    return pa.array(results, type=_UUID_STRING_TYPE)
 
 
 @register(
@@ -107,4 +122,6 @@ def timestamp_ns_to_ms_utc(array: pa.Array, params: dict) -> pa.Array:
 
     Nanosecond and microsecond precision is truncated (not rounded) to milliseconds.
     """
-    return array.cast(pa.timestamp("ms", tz="UTC"), safe=False)
+    if array.type.equals(_TIMESTAMP_MS_UTC_TYPE):
+        return array
+    return array.cast(_TIMESTAMP_MS_UTC_TYPE, safe=False)

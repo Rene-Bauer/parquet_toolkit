@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_scaler.py::test_scale_down_triggers_on_combined_error_and_throughput_drop tests/test_scaler.py::test_scale_down_does_not_trigger_on_errors_alone tests/test_scaler.py::test_scale_down_does_not_trigger_on_throughput_drop_alone tests/test_scaler.py::test_scale_down_never_goes_below_1 -v)",
+      "Bash(python -m pytest -xvs)",
+      "Bash(python -m pytest tests/test_scaler.py -v)",
+      "Bash(python -m pytest -v)",
+      "Bash(python -m pytest -v --tb=short -q)"
+    ]
+  }
+}

@@ -4,7 +4,9 @@ Main application window for the Parquet Schema Transformer.
 from __future__ import annotations
 
 import csv
+import ctypes
 import os
+import sys
 from datetime import datetime, timedelta
 from time import perf_counter
 
@@ -31,7 +33,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from gui.resources_panel import ResourcesPanel
 from gui.schema_table import SchemaTable
+from gui.system_monitor_worker import SystemMonitorWorker
 from gui.workers import SchemaLoaderWorker, TransformWorker, _format_bytes
 from parquet_transform.checkpoint import FailedList, RunCheckpoint
 
@@ -44,6 +48,24 @@ MAX_LOG_ENTRIES = 5_000
 _COLOR_ERROR   = QColor("#cc0000")   # red   – network failures
 _COLOR_CORRUPT = QColor("#cc6600")   # orange – corrupted / non-retriable
 _COLOR_WARN    = QColor("#aa8800")   # amber  – warnings (unknown size etc.)
+
+# Windows standby prevention via SetThreadExecutionState
+_ES_CONTINUOUS      = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def _prevent_standby() -> None:
+    """Tell Windows to keep the system awake (no standby/sleep)."""
+    if sys.platform == "win32":
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED
+        )
+
+
+def _allow_standby() -> None:
+    """Restore normal Windows standby behaviour."""
+    if sys.platform == "win32":
+        ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
 
 
 def _format_duration(seconds: float) -> str:
@@ -110,9 +132,20 @@ class MainWindow(QMainWindow):
         root.addWidget(self._build_schema_group())
         root.addWidget(self._build_output_group())
         root.addWidget(self._build_action_row())
+
+        # System resources panel — lives between action row and log
+        self._resources_panel = ResourcesPanel()
+        root.addWidget(self._resources_panel)
+
         root.addWidget(self._build_log_group())
 
         self._build_statusbar()
+
+        # Start background system monitor (runs for the whole app lifetime)
+        self._sys_monitor = SystemMonitorWorker(interval_ms=1000, parent=self)
+        self._sys_monitor.snapshot_ready.connect(self._resources_panel.update_snapshot)
+        self._sys_monitor.start()
+
         self._set_ready_state()
 
     # ------------------------------------------------------------------
@@ -380,6 +413,7 @@ class MainWindow(QMainWindow):
         self._status_label.setText("Loading schema...")
 
     def _set_schema_loaded_state(self) -> None:
+        _allow_standby()
         self._load_btn.setEnabled(True)
         self._dryrun_btn.setEnabled(True)
         self._apply_btn.setEnabled(True)
@@ -571,6 +605,7 @@ class MainWindow(QMainWindow):
         self._dry_run = dry_run
         self._retry_depth = 0
         self._corrupted_blobs = []
+        _prevent_standby()
 
         # Feature 5: build prefix queue
         main_prefix = self._prefix_edit.text().strip()
@@ -757,6 +792,7 @@ class MainWindow(QMainWindow):
             output_prefix=output_prefix,
             dry_run=self._dry_run,
             worker_count=worker_count,
+            max_worker_cap=self._worker_spin.maximum(),
             max_attempts=max_attempts,
             blob_names=blob_names,
             blob_sizes=blob_sizes,
@@ -777,6 +813,9 @@ class MainWindow(QMainWindow):
         self._transform_worker.resumed_signal.connect(self._on_worker_resumed)
         self._transform_worker.workers_scaled.connect(self._on_workers_scaled)
         self._transform_worker.log_message.connect(self._log_info)
+        self._transform_worker.throughput_update.connect(
+            self._resources_panel.update_worker_throughput
+        )
         self._transform_worker.start()
 
     # ------------------------------------------------------------------
@@ -852,7 +891,7 @@ class MainWindow(QMainWindow):
                     finish_str = finish_time.strftime("%H:%M")
                 else:
                     finish_str = finish_time.strftime("%d.%m. %H:%M")
-                parts.append(f"ETA {_format_duration(eta_s)} (fertig ~{finish_str})")
+                parts.append(f"ETA {_format_duration(eta_s)} (done ~{finish_str})")
         self._throughput_label.setText("  " + "  ·  ".join(parts) if parts else "")
 
         self._status_label.setText(f"{completed} / {total} files")
@@ -935,6 +974,7 @@ class MainWindow(QMainWindow):
             self._start_next_prefix()
         else:
             # All done
+            self._resources_panel.clear_worker_throughput()
             self._status_label.setText(msg)
             self._set_schema_loaded_state()
 
@@ -974,6 +1014,7 @@ class MainWindow(QMainWindow):
     def _on_transform_cancelled(self) -> None:
         self._retry_depth = 0
         self._pending_prefixes = []
+        self._resources_panel.clear_worker_throughput()
         self._set_schema_loaded_state()
         self._write_unhealthy_summary()
         self._log_info("Cancelled by user.")
@@ -1136,6 +1177,16 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             self._log_error(f"Failed to export unhealthy CSV: {exc}")
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        """Stop the background system monitor before the window closes."""
+        self._sys_monitor.stop()
+        self._sys_monitor.wait(2000)   # give it up to 2 s to exit cleanly
+        super().closeEvent(event)
 
     # ------------------------------------------------------------------
     # Misc helpers
