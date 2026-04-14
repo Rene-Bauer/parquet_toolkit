@@ -59,11 +59,11 @@ worker count.  0.1 = trigger at 10 %+ error rate."""
 SCALER_WINDOW_SIZE: int = 100
 """Rolling window size — number of upload measurements kept."""
 
-SCALER_MIN_SAMPLES: int = 50
+SCALER_MIN_SAMPLES: int = 5
 """Minimum measurements collected before any scaling decision is made."""
 
-SCALER_CHECK_INTERVAL: int = 150
-"""Number of successfully completed files between scaling checks."""
+SCALER_CHECK_INTERVAL: int = 5
+"""Number of upload-relevant results (success or error) between scaling checks."""
 
 SCALER_DOWN_ERROR_RATE: float = 0.15
 """Scale-down trigger: error rate threshold (fraction, e.g. 0.15 = 15%)."""
@@ -74,11 +74,51 @@ SCALER_DOWN_THROUGHPUT_DROP: float = 0.30
 SCALER_UP_MIN_HEADROOM: int = 2
 """Scale-up trigger: minimum headroom slots required to consider scaling up."""
 
-SCALER_UP_CONFIRM_CHECKS: int = 2
+SCALER_UP_CONFIRM_CHECKS: int = 1
 """Scale-up trigger: headroom must be stable for this many consecutive checks."""
 
-SCALER_UP_MAX_STEP: int = 4
+SCALER_UP_MAX_STEP: int = 8
 """Scale-up: maximum workers added per incremental check."""
+
+SCALER_HOT_ERROR_RATE: float = 0.5
+"""Error rate threshold that triggers immediate scale-down (hot spike)."""
+
+SCALER_HOT_ERROR_MIN_SAMPLES: int = 20
+"""Minimum window size before hot-error detection becomes active."""
+
+SCALER_RECOVERY_ERROR_CEILING: float = 0.05
+"""Scale-up allowed only when window error rate falls below this ceiling."""
+
+SCALER_OVERRUN_HEADROOM_THRESHOLD: int = 1
+"""Capacity-overrun scale-down: fire when headroom drops below
+``-SCALER_OVERRUN_HEADROOM_THRESHOLD`` (i.e., current workers exceed the
+sustainable bandwidth estimate by more than this many slots).
+A threshold of 1 means: scale down as soon as we have ≥2 workers more than
+the connection can sustain at the current file size."""
+
+# --- Phase B: AIMD plateau guard ---
+
+SCALER_PLATEAU_THRESHOLD: float = 0.05
+"""Minimum fractional throughput gain (vs the bps recorded at the last scale-up)
+required before another scale-up is allowed.  0.05 = 5%.
+Prevents jumping past the network saturation point: if adding workers didn't
+actually increase total MB/s by at least this margin, we've hit the ceiling."""
+
+# --- Phase C: Universal Scalability Law (USL) ---
+
+SCALER_USL_MIN_LEVELS: int = 5
+"""Minimum number of *distinct* worker-count levels that must each have at least
+``SCALER_USL_MIN_SAMPLES_PER_LEVEL`` throughput observations before a USL curve
+fit is attempted."""
+
+SCALER_USL_MIN_SAMPLES_PER_LEVEL: int = 3
+"""Minimum observations per worker-count level for USL fitting."""
+
+SCALER_USL_AGREE_TOLERANCE: float = 0.20
+"""Fractional difference below which the formula estimate (Phase B) and the USL
+N_opt (Phase C) are considered to *agree*.  When they agree the USL ceiling is
+enforced; when they disagree the more conservative of the two is used and the
+scaler adds only one worker at a time until they converge.  0.20 = within 20%."""
 
 
 _EXPECTED_OUTPUT_TYPES: dict[str, pa.DataType] = {
@@ -199,6 +239,9 @@ class TransformWorker(QThread):
     # (new_count, old_count, direction, reason)
     # direction: "up" | "down"
     log_message = pyqtSignal(str)
+    throughput_update = pyqtSignal(float, float)
+    # (measured_total_bps, estimated_capacity_bps)
+    # Emitted on every scaler check — even when no scaling decision is made.
 
     def __init__(
         self,
@@ -209,6 +252,7 @@ class TransformWorker(QThread):
         output_prefix: str | None,
         dry_run: bool = False,
         worker_count: int = 1,
+        max_worker_cap: int | None = None,
         max_attempts: int = 1,
         blob_names: list[str] | None = None,
         blob_sizes: dict[str, int] | None = None,
@@ -226,6 +270,8 @@ class TransformWorker(QThread):
         self._output_prefix = output_prefix
         self._dry_run = dry_run
         self._worker_count = max(1, worker_count)
+        cap = max_worker_cap if max_worker_cap is not None else self._worker_count
+        self._autoscale_max_workers = max(self._worker_count, cap)
         self._max_attempts = max(1, max_attempts)
         self._blob_names = blob_names
         self._blob_sizes = blob_sizes
@@ -236,6 +282,9 @@ class TransformWorker(QThread):
         self._cancel_event = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()
+        self._completed_since_scale_check = 0
+        self._pending_force_scale = False
+        self._real_work_started = False
 
     def cancel(self) -> None:
         self._cancel_event.set()
@@ -330,7 +379,9 @@ class TransformWorker(QThread):
 
         # Adaptive scaler (only active when autoscale=True and not a dry run)
         scaler: AdaptiveScaler | None = None
-        completed_since_check: int = 0
+        self._completed_since_scale_check = 0
+        self._pending_force_scale = False
+        self._real_work_started = False
         if self._autoscale and not self._dry_run:
             scaler = AdaptiveScaler(
                 window_size=SCALER_WINDOW_SIZE,
@@ -341,13 +392,21 @@ class TransformWorker(QThread):
                 up_min_headroom=SCALER_UP_MIN_HEADROOM,
                 up_confirm_checks=SCALER_UP_CONFIRM_CHECKS,
                 up_max_step=SCALER_UP_MAX_STEP,
-                configured_max_workers=self._worker_count,
+                configured_max_workers=self._autoscale_max_workers,
+                hot_error_rate=SCALER_HOT_ERROR_RATE,
+                hot_error_min_samples=SCALER_HOT_ERROR_MIN_SAMPLES,
+                recovery_error_ceiling=SCALER_RECOVERY_ERROR_CEILING,
+                overrun_headroom_threshold=SCALER_OVERRUN_HEADROOM_THRESHOLD,
+                plateau_threshold=SCALER_PLATEAU_THRESHOLD,
+                usl_min_levels=SCALER_USL_MIN_LEVELS,
+                usl_min_samples_per_level=SCALER_USL_MIN_SAMPLES_PER_LEVEL,
+                usl_agree_tolerance=SCALER_USL_AGREE_TOLERANCE,
             )
 
         def finalize_success(*, blob_name, worker_id, attempts, duration_ms,
                              skipped, note, size_bytes):
-            nonlocal processed, completed, total_duration_ms, completed_since_check
-            do_scale_check = False
+            nonlocal processed, completed, total_duration_ms
+            first_real_trigger = False
             with stats_lock:
                 processed += 1
                 completed += 1
@@ -358,18 +417,14 @@ class TransformWorker(QThread):
                 if self._failed_list:
                     self._failed_list.remove(blob_name)
                 if scaler is not None and not skipped:
-                    completed_since_check += 1
-                    if completed_since_check >= SCALER_CHECK_INTERVAL:
-                        completed_since_check = 0
-                        do_scale_check = True
+                    self._completed_since_scale_check += 1
+                    if not self._real_work_started:
+                        self._real_work_started = True
+                        self._pending_force_scale = True
+                        first_real_trigger = True
 
-            if do_scale_check:
-                old_count = self._worker_count
-                new_count, reason = scaler.should_scale(old_count, p95_bytes)
-                if new_count != old_count:
-                    self._worker_count = new_count  # GIL makes int assignment atomic in CPython
-                    direction = "up" if new_count > old_count else "down"
-                    self.workers_scaled.emit(new_count, old_count, direction, reason)
+            if first_real_trigger:
+                self.log_message.emit("[Autoscale WARN] First transformed file detected — forcing scale check")
 
             self.progress.emit(completed_so_far, total, blob_name,
                                duration_ms, worker_id, skipped, note, size_bytes)
@@ -393,6 +448,10 @@ class TransformWorker(QThread):
                         "(checkpoint)",
                         f"[Failed List] Recorded {ftype} failure: {blob_name}"
                     )
+                # Network failures count towards scaling checks
+                if scaler is not None and retriable:
+                    self._completed_since_scale_check += 1
+
             if retriable:
                 self._log_final_failure(blob_name, attempts, short_error, error, suppress_trace)
             self.progress.emit(completed_so_far, total, blob_name,
@@ -414,6 +473,48 @@ class TransformWorker(QThread):
             next_round_lock = threading.Lock()
             conn_error_count = 0
             conn_error_lock  = threading.Lock()
+
+            # Dynamic thread pool — new threads may be spawned mid-pass on scale-up.
+            _threads: list[threading.Thread] = []
+            _threads_lock = threading.Lock()
+            _next_id = [1]  # Worker IDs, shared by initial and dynamically spawned threads
+
+            def _spawn_workers(count: int) -> None:
+                """Spawn `count` new worker threads, each with its own sentinel."""
+                for _ in range(count):
+                    wid = _next_id[0]
+                    _next_id[0] += 1
+                    task_queue.put(sentinel)
+                    t = threading.Thread(target=worker_loop, args=(wid,), daemon=True)
+                    with _threads_lock:
+                        _threads.append(t)
+                    t.start()
+
+            # One-at-a-time scale check: the first thread to acquire wins;
+            # others skip (the interval counter will catch the next window).
+            _scale_check_lock = threading.Lock()
+
+            def _try_scale_check() -> None:
+                """Run scale check if due; spawn new threads on scale-up.
+
+                Compares the scaler's target against *actually alive* threads so
+                that threads which survived a soft scale-down are counted and we
+                never stack new threads on top of already-running ones.
+                """
+                if not _scale_check_lock.acquire(blocking=False):
+                    return
+                try:
+                    delta = self._maybe_run_scale_check(scaler, p95_bytes)
+                    if delta > 0:
+                        # How many threads are genuinely still running?
+                        with _threads_lock:
+                            actual_alive = sum(1 for t in _threads if t.is_alive())
+                        target = self._worker_count  # just updated by _maybe_run_scale_check
+                        to_spawn = max(0, target - actual_alive)
+                        if to_spawn > 0:
+                            _spawn_workers(to_spawn)
+                finally:
+                    _scale_check_lock.release()
 
             def worker_loop(worker_id: int) -> None:
                 nonlocal conn_error_count
@@ -444,6 +545,10 @@ class TransformWorker(QThread):
                             scaler.record_upload(result.upload_bytes, result.upload_seconds, True)
                         elif result.status == "error":
                             scaler.record_upload(0, 0.0, False)
+                        if scaler.consume_hot_error_flag():
+                            self._pending_force_scale = True
+                            self.log_message.emit("[Autoscale WARN] Timeout spike detected — forcing scale check")
+                            _try_scale_check()
 
                     if result.status in {"success", "skipped"}:
                         finalize_success(
@@ -488,16 +593,23 @@ class TransformWorker(QThread):
                             )
                             duration_tracker.pop(blob_name, None)
 
+                    # Interval / forced scale check (catches first-file force and regular intervals)
+                    if scaler is not None:
+                        _try_scale_check()
+
                     task_queue.task_done()
 
-            threads = [
-                threading.Thread(target=worker_loop, args=(i + 1,), daemon=True)
-                for i in range(worker_total)
-            ]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
+            _spawn_workers(worker_total)
+
+            # Wait for all threads, including those dynamically spawned during scale-up.
+            while True:
+                with _threads_lock:
+                    alive = [t for t in _threads if t.is_alive()]
+                if not alive:
+                    break
+                for t in alive:
+                    t.join(timeout=0.5)
+
             return next_round, conn_error_count
 
         remaining = list(blob_names)
@@ -521,7 +633,7 @@ class TransformWorker(QThread):
 
             if conn_errors > 0 and conn_errors >= len(remaining) * CONNECTION_ERROR_THROTTLE_RATIO:
                 old_count = self._worker_count
-                self._worker_count = max(1, self._worker_count // 2)
+                self._worker_count = max(2, self._worker_count // 2)
                 if self._worker_count < old_count:
                     self.workers_reduced.emit(self._worker_count, conn_errors)
 
@@ -560,6 +672,65 @@ class TransformWorker(QThread):
             message += f"\n{full_error.strip()}"
         self.file_error.emit(blob_name, message)
 
+    def _maybe_run_scale_check(self, scaler: AdaptiveScaler | None, p95_bytes: int) -> int:
+        """Run AdaptiveScaler when either interval or forced conditions are met.
+
+        Returns the worker-count delta: positive means scale-up, negative means scale-down,
+        0 means no change.  The caller is responsible for spawning new threads on scale-up.
+
+        Always emits ``throughput_update`` when a check actually runs (regardless
+        of whether the worker count changes), so the UI can update its live meters.
+        """
+        if scaler is None or p95_bytes <= 0:
+            return 0
+        interval_due = self._completed_since_scale_check >= SCALER_CHECK_INTERVAL
+        force_due = self._pending_force_scale
+        if not (interval_due or force_due):
+            return 0
+        if not scaler.window_ready():
+            return 0
+        if interval_due:
+            self._completed_since_scale_check = 0
+        if force_due:
+            self._pending_force_scale = False
+
+        old_count = self._worker_count
+
+        # Compute throughput at the current (pre-decision) worker count.
+        # This is what gets recorded for USL fitting — it reflects actual
+        # observed performance at old_count, not a projection.
+        measured_bps, capacity_bps = scaler.compute_throughput_stats(old_count, p95_bytes)
+
+        # Phase C: feed (N, bps) observation before the scaling decision so the
+        # USL model learns from the current stable state, not the new target.
+        if measured_bps > 0:
+            scaler.record_throughput_observation(old_count, measured_bps)
+
+        # Scale decision (Phase B plateau guard + Phase C ceiling both apply inside)
+        new_count, reason = scaler.should_scale(old_count, p95_bytes)
+        if new_count != old_count:
+            self._worker_count = new_count
+            direction = "up" if new_count > old_count else "down"
+            self.workers_scaled.emit(new_count, old_count, direction, reason)
+
+        # Log the moment Phase C (USL) first comes online
+        if scaler.usl_just_activated():
+            alpha, beta, n_opt = scaler.get_usl_result()
+            self.log_message.emit(
+                f"[USL] Model fitted — α={alpha:.3f} (contention) "
+                f"β={beta:.4f} (coherency) → N_opt={n_opt} workers"
+            )
+
+        # Emit throughput stats for the ResourcesPanel (use new worker count so
+        # the UI reflects the post-decision state)
+        if self._worker_count != old_count:
+            measured_bps, capacity_bps = scaler.compute_throughput_stats(
+                self._worker_count, p95_bytes
+            )
+        self.throughput_update.emit(measured_bps, capacity_bps)
+
+        return new_count - old_count
+
     def _process_blob_once(self, client: BlobStorageClient, blob_name: str) -> _FileResult:
         """Download, optionally transform, and upload a single blob once."""
         file_start = perf_counter()
@@ -584,7 +755,7 @@ class TransformWorker(QThread):
             upload_seconds = 0.0
             if not self._dry_run:
                 out_buf = io.BytesIO()
-                pq.write_table(table, out_buf)
+                pq.write_table(table, out_buf, compression="zstd", compression_level=3)
                 upload_data = out_buf.getvalue()
                 t_upload = perf_counter()
                 client.upload_bytes(output_name, upload_data,
