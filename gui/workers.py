@@ -43,8 +43,16 @@ except (ImportError, AttributeError):
 # Module-level constants
 # ---------------------------------------------------------------------------
 
-DOWNLOAD_TIMEOUT_S: int = 120
-"""Seconds before an Azure download is considered hung and aborted."""
+DOWNLOAD_TIMEOUT_S: int = 200
+"""Seconds before an Azure download is considered hung and aborted.
+
+Set to 200 s (previously 120 s) after production logs showed that files
+timing out at 120 s consistently succeeded on retry within 200–450 s,
+indicating a degraded-but-alive network rather than dead connections.
+Raising the limit reduces unnecessary retry-pass churn and false-positive
+error signals to the autoscaler without meaningfully delaying dead-connection
+detection (the rolling window fills from other parallel workers).
+"""
 
 UPLOAD_TIMEOUT_S: int = 300
 """Seconds before an Azure upload is considered hung and aborted."""
@@ -74,7 +82,7 @@ SCALER_DOWN_THROUGHPUT_DROP: float = 0.30
 SCALER_UP_MIN_HEADROOM: int = 2
 """Scale-up trigger: minimum headroom slots required to consider scaling up."""
 
-SCALER_UP_CONFIRM_CHECKS: int = 1
+SCALER_UP_CONFIRM_CHECKS: int = 2
 """Scale-up trigger: headroom must be stable for this many consecutive checks."""
 
 SCALER_UP_MAX_STEP: int = 8
@@ -241,6 +249,8 @@ class TransformWorker(QThread):
     log_message = pyqtSignal(str)
     throughput_update = pyqtSignal(float, float)
     # (measured_total_bps, estimated_capacity_bps)
+    bandwidth_cap_changed = pyqtSignal(int)
+    # effective bandwidth ceiling in workers (dynamic, emitted whenever it changes)
     # Emitted on every scaler check — even when no scaling decision is made.
 
     def __init__(
@@ -463,16 +473,27 @@ class TransformWorker(QThread):
 
             worker_total = min(self._worker_count, len(blob_batch))
             task_queue: queue.Queue[Any] = queue.Queue()
-            sentinel = object()
+            sentinel = object()  # used only as a cancel-path escape hatch; not pre-pushed
             for name in blob_batch:
                 task_queue.put(name)
-            for _ in range(worker_total):
-                task_queue.put(sentinel)
 
             next_round: list[str] = []
             next_round_lock = threading.Lock()
             conn_error_count = 0
             conn_error_lock  = threading.Lock()
+
+            # Pending work counter — decremented each time a file reaches its final
+            # disposition (success or all attempts exhausted).  When it hits 0 and
+            # the queue is empty, idle threads exit cleanly.
+            pending = [len(blob_batch)]
+            pending_lock = threading.Lock()
+
+            # Cooperative scale-down: when the scaler requests fewer workers, this
+            # counter is incremented by the delta.  Each thread checks before pulling
+            # its next task and exits voluntarily, leaving the file in the queue for
+            # the remaining (now fewer) threads to pick up.
+            _exit_requested = [0]
+            _exit_lock = threading.Lock()
 
             # Dynamic thread pool — new threads may be spawned mid-pass on scale-up.
             _threads: list[threading.Thread] = []
@@ -480,11 +501,14 @@ class TransformWorker(QThread):
             _next_id = [1]  # Worker IDs, shared by initial and dynamically spawned threads
 
             def _spawn_workers(count: int) -> None:
-                """Spawn `count` new worker threads, each with its own sentinel."""
+                """Spawn `count` new worker threads.
+
+                Threads self-terminate via the pending counter or the cooperative
+                exit mechanism; no sentinel is pushed per thread.
+                """
                 for _ in range(count):
                     wid = _next_id[0]
                     _next_id[0] += 1
-                    task_queue.put(sentinel)
                     t = threading.Thread(target=worker_loop, args=(wid,), daemon=True)
                     with _threads_lock:
                         _threads.append(t)
@@ -513,91 +537,146 @@ class TransformWorker(QThread):
                         to_spawn = max(0, target - actual_alive)
                         if to_spawn > 0:
                             _spawn_workers(to_spawn)
+                    elif delta < 0:
+                        # Request |delta| threads to exit after their current file.
+                        # Each thread checks _exit_requested before pulling the next
+                        # task, so the reduction takes effect as soon as threads
+                        # finish whatever they are currently downloading/uploading.
+                        with _exit_lock:
+                            _exit_requested[0] += abs(delta)
                 finally:
                     _scale_check_lock.release()
 
             def worker_loop(worker_id: int) -> None:
                 nonlocal conn_error_count
                 worker_client = BlobStorageClient(self._connection_string, self._container)
-                while True:
-                    item = task_queue.get()
-                    if item is sentinel:
-                        task_queue.task_done()
-                        break
+                try:
+                    while True:
+                        # ── Cooperative scale-down ──────────────────────────────────
+                        # Before pulling the next task, check whether the scaler has
+                        # requested a reduction.  The current file (if any) has already
+                        # been processed; the next file stays in the queue for the
+                        # surviving threads.  This limits extra bandwidth consumption
+                        # to at most one extra file per excess thread after a halving.
+                        with _exit_lock:
+                            if _exit_requested[0] > 0:
+                                _exit_requested[0] -= 1
+                                return
 
-                    blob_name = str(item)
-                    self._pause_event.wait()
-                    if self._cancel_event.is_set():
-                        task_queue.task_done()
-                        continue
+                        # ── Pull next task (short timeout so exit check re-runs) ───
+                        try:
+                            item = task_queue.get(block=True, timeout=0.5)
+                        except queue.Empty:
+                            # Queue empty — exit only when all pending work is done.
+                            # pending > 0 means another thread may re-enqueue a file
+                            # after a failed attempt; keep waiting.
+                            with pending_lock:
+                                if pending[0] <= 0:
+                                    return
+                            continue
 
-                    size_bytes = blob_sizes.get(blob_name, 0)
-                    attempt_counter[blob_name] = attempt_counter.get(blob_name, 0) + 1
-                    result = self._process_blob_once(worker_client, blob_name)
-                    duration_tracker[blob_name] = (
-                        duration_tracker.get(blob_name, 0.0) + result.duration_ms
-                    )
-                    aggregated_duration = duration_tracker[blob_name]
+                        if item is sentinel:
+                            task_queue.task_done()
+                            return
 
-                    # Feed upload measurement to scaler
-                    if scaler is not None:
-                        if result.upload_bytes > 0 and result.upload_seconds > 0:
-                            scaler.record_upload(result.upload_bytes, result.upload_seconds, True)
-                        elif result.status == "error":
-                            scaler.record_upload(0, 0.0, False)
-                        if scaler.consume_hot_error_flag():
-                            self._pending_force_scale = True
-                            self.log_message.emit("[Autoscale WARN] Timeout spike detected — forcing scale check")
+                        blob_name = str(item)
+                        self._pause_event.wait()
+                        if self._cancel_event.is_set():
+                            # Return the file to the queue so the end-of-pass drain
+                            # can collect it for the next run.
+                            task_queue.put(blob_name)
+                            task_queue.task_done()
+                            return
+
+                        size_bytes = blob_sizes.get(blob_name, 0)
+                        attempt_counter[blob_name] = attempt_counter.get(blob_name, 0) + 1
+                        result = self._process_blob_once(worker_client, blob_name)
+                        duration_tracker[blob_name] = (
+                            duration_tracker.get(blob_name, 0.0) + result.duration_ms
+                        )
+                        aggregated_duration = duration_tracker[blob_name]
+
+                        # Feed upload measurement to scaler
+                        if scaler is not None:
+                            if result.upload_bytes > 0 and result.upload_seconds > 0:
+                                scaler.record_upload(result.upload_bytes, result.upload_seconds, True)
+                            elif result.status == "error":
+                                scaler.record_upload(0, 0.0, False)
+                            if scaler.consume_hot_error_flag():
+                                self._pending_force_scale = True
+                                self.log_message.emit("[Autoscale WARN] Timeout spike detected — forcing scale check")
+                                _try_scale_check()
+
+                        if result.status in {"success", "skipped"}:
+                            finalize_success(
+                                blob_name=blob_name, worker_id=worker_id,
+                                attempts=attempt_counter[blob_name],
+                                duration_ms=aggregated_duration,
+                                skipped=result.status == "skipped",
+                                note=result.skip_reason or "", size_bytes=size_bytes,
+                            )
+                            duration_tracker.pop(blob_name, None)
+                            with pending_lock:
+                                pending[0] -= 1
+
+                        else:
+                            error_text = result.error or "Unknown error"
+                            short_msg  = result.short_error or _first_line(error_text)
+
+                            if result.suppress_trace:
+                                with conn_error_lock:
+                                    conn_error_count += 1
+
+                            if not result.retriable:
+                                # Corrupted file — permanent failure, never retry.
+                                self.corrupted_blob.emit(blob_name, short_msg, size_bytes)
+                                finalize_failure(
+                                    blob_name=blob_name, worker_id=worker_id,
+                                    attempts=attempt_counter[blob_name],
+                                    duration_ms=aggregated_duration, error=error_text,
+                                    short_error=short_msg, suppress_trace=result.suppress_trace,
+                                    retriable=False, size_bytes=size_bytes,
+                                )
+                                duration_tracker.pop(blob_name, None)
+                                with pending_lock:
+                                    pending[0] -= 1
+
+                            elif attempt_counter.get(blob_name, 0) < self._max_attempts:
+                                # Retriable error, more attempts remain.
+                                # Re-queue immediately so the (now smaller) thread pool
+                                # picks it up without waiting for a new pass or back-off.
+                                # The total attempt count is preserved in attempt_counter
+                                # across both intra-pass retries and inter-pass rounds.
+                                task_queue.put(blob_name)
+                                self._completed_since_scale_check += 1  # keep interval checks firing
+                                self._log_retry(
+                                    blob_name, attempt_counter[blob_name],
+                                    short_msg,
+                                    None if result.suppress_trace else error_text,
+                                )
+                                # pending unchanged — the file still needs work
+
+                            else:
+                                # All attempts exhausted.
+                                finalize_failure(
+                                    blob_name=blob_name, worker_id=worker_id,
+                                    attempts=attempt_counter[blob_name],
+                                    duration_ms=aggregated_duration, error=error_text,
+                                    short_error=short_msg, suppress_trace=result.suppress_trace,
+                                    retriable=True, size_bytes=size_bytes,
+                                )
+                                duration_tracker.pop(blob_name, None)
+                                with pending_lock:
+                                    pending[0] -= 1
+
+                        # Interval / forced scale check
+                        if scaler is not None:
                             _try_scale_check()
 
-                    if result.status in {"success", "skipped"}:
-                        finalize_success(
-                            blob_name=blob_name, worker_id=worker_id,
-                            attempts=attempt_counter[blob_name],
-                            duration_ms=aggregated_duration,
-                            skipped=result.status == "skipped",
-                            note=result.skip_reason or "", size_bytes=size_bytes,
-                        )
-                        duration_tracker.pop(blob_name, None)
-                    else:
-                        error_text = result.error or "Unknown error"
-                        short_msg  = result.short_error or _first_line(error_text)
+                        task_queue.task_done()
 
-                        if result.suppress_trace:
-                            with conn_error_lock:
-                                conn_error_count += 1
-
-                        if not result.retriable:
-                            self.corrupted_blob.emit(blob_name, short_msg, size_bytes)
-                            finalize_failure(
-                                blob_name=blob_name, worker_id=worker_id,
-                                attempts=attempt_counter[blob_name],
-                                duration_ms=aggregated_duration, error=error_text,
-                                short_error=short_msg, suppress_trace=result.suppress_trace,
-                                retriable=False, size_bytes=size_bytes,
-                            )
-                            duration_tracker.pop(blob_name, None)
-                        elif pass_number < self._max_attempts:
-                            with next_round_lock:
-                                next_round.append(blob_name)
-                            self._log_retry(blob_name, attempt_counter[blob_name],
-                                            short_msg,
-                                            None if result.suppress_trace else error_text)
-                        else:
-                            finalize_failure(
-                                blob_name=blob_name, worker_id=worker_id,
-                                attempts=attempt_counter[blob_name],
-                                duration_ms=aggregated_duration, error=error_text,
-                                short_error=short_msg, suppress_trace=result.suppress_trace,
-                                retriable=True, size_bytes=size_bytes,
-                            )
-                            duration_tracker.pop(blob_name, None)
-
-                    # Interval / forced scale check (catches first-file force and regular intervals)
-                    if scaler is not None:
-                        _try_scale_check()
-
-                    task_queue.task_done()
+                finally:
+                    worker_client.close()
 
             _spawn_workers(worker_total)
 
@@ -609,6 +688,21 @@ class TransformWorker(QThread):
                     break
                 for t in alive:
                     t.join(timeout=0.5)
+
+            # Drain files remaining in the queue after cooperative thread exits.
+            # These are files that were re-queued after a failure (or not yet
+            # started) when threads exited early due to a scale-down.  They
+            # haven't exhausted max_attempts, so forward them to next_round for
+            # the next pass (which runs with the reduced worker count after the
+            # back-off delay).
+            while True:
+                try:
+                    item = task_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(item, str):
+                    with next_round_lock:
+                        next_round.append(item)
 
             return next_round, conn_error_count
 
@@ -720,6 +814,14 @@ class TransformWorker(QThread):
                 f"[USL] Model fitted — α={alpha:.3f} (contention) "
                 f"β={beta:.4f} (coherency) → N_opt={n_opt} workers"
             )
+
+        # Log and signal whenever the effective bandwidth ceiling changes (grows or shrinks)
+        cap_changed, new_cap = scaler.consume_bandwidth_cap_update()
+        if cap_changed:
+            self.log_message.emit(
+                f"[Autoscale] Bandwidth ceiling: {new_cap} workers"
+            )
+            self.bandwidth_cap_changed.emit(new_cap)
 
         # Emit throughput stats for the ResourcesPanel (use new worker count so
         # the UI reflects the post-decision state)

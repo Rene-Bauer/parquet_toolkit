@@ -8,6 +8,7 @@ access and cannot be streamed sequentially.
 from __future__ import annotations
 
 import io
+import time
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -83,11 +84,31 @@ class BlobStorageClient:
     # ------------------------------------------------------------------
 
     def download_bytes(self, blob_name: str, timeout: int = 120) -> bytes:
-        """Download a blob to memory and return its raw bytes."""
+        """Download a blob to memory and return its raw bytes.
+
+        Enforces a hard wall-clock deadline of ``timeout`` seconds for the
+        *entire* download, not just the per-chunk connection setup.  This
+        prevents degraded (but non-failing) Azure connections from holding a
+        worker thread for hundreds of seconds when the network is saturated.
+
+        The same ``timeout`` value is passed to the Azure SDK for per-request
+        (per-chunk) timeouts; the wall-clock deadline catches the cumulative
+        case where many small chunks each succeed within the per-chunk limit
+        but the total time balloons past acceptable bounds.
+        """
+        deadline = time.monotonic() + timeout
         blob_client = self._container.get_blob_client(blob_name)
         downloader = blob_client.download_blob(timeout=timeout)
         try:
-            return downloader.readall()
+            chunks: list[bytes] = []
+            for chunk in downloader.chunks():
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"Download of {blob_name!r} exceeded {timeout}s "
+                        f"total wall-clock timeout"
+                    )
+                chunks.append(chunk)
+            return b"".join(chunks)
         except Exception:
             # Silence the SDK's "Incomplete download." print() in __del__:
             # the StorageStreamDownloader prints to stdout when garbage-collected

@@ -5,10 +5,18 @@ Two phases run in parallel and compare notes:
 
 Phase B — AIMD + plateau guard (active from the first check)
     Scale up by at most ``up_max_step`` workers per check, but only when total
-    throughput has grown by at least ``plateau_threshold`` since the last
-    scale-up.  This prevents the "big formula jump → saturation cascade" pattern
-    and is directly analogous to TCP's additive-increase / multiplicative-
-    decrease asymmetry.
+    throughput (per_conn × N) has NOT dropped by more than ``plateau_threshold``
+    since the last scale-up.  Comparing *total* throughput correctly identifies
+    saturation on both dedicated and shared-bandwidth links:
+
+    - Dedicated link: total grows with workers — guard never fires.
+    - Shared link: per_conn halves when doubling workers, but total stays flat
+      or grows — guard does not fire (correct: no saturation).
+    - True saturation: total actually *falls* — guard fires, scale-up paused.
+
+    This prevents the "big formula jump → saturation cascade" pattern and is
+    directly analogous to TCP's additive-increase / multiplicative-decrease
+    asymmetry.
 
 Phase C — Universal Scalability Law (USL) curve fit
     Activates once ``usl_min_levels`` distinct worker-count levels each have
@@ -95,6 +103,28 @@ class AdaptiveScaler:
         self._plateau_threshold = plateau_threshold
         self._last_scale_up_bps: float = 0.0
 
+        # Track whether we are currently inside a crash cascade so that the
+        # crash ceiling is only set once per cascade (at the first halving),
+        # not lowered further on every subsequent halving.  The flag is cleared
+        # when a successful scale-up occurs, signalling that recovery is done.
+        self._in_crash_cascade: bool = False
+
+        # Dynamic bandwidth ceiling — recomputed on every scale-UP check from the
+        # current rolling-window measurements:
+        #   _bandwidth_cap = min(crash_ceiling, configured_max,
+        #                        int(per_conn_bw × workers × timeout / p95 × 0.7))
+        # This is the theoretical worker count the current bandwidth could sustain
+        # within the upload timeout.  It grows during the linear-scaling ramp and
+        # falls when the network degrades.  Callers can poll consume_bandwidth_cap_update()
+        # to detect changes and log them.
+        self._bandwidth_cap: int = configured_max_workers
+        self._bandwidth_cap_prev: int = configured_max_workers  # for change detection
+
+        # Crash ceiling — only ever decreases, set to current_workers whenever a
+        # critical (≥50%) error rate triggers a halving.  Bounds _bandwidth_cap so
+        # the scaler won't re-escalate past the level where it previously crashed.
+        self._crash_ceiling: int = configured_max_workers
+
         # Phase C — USL
         self._usl_min_levels = usl_min_levels
         self._usl_min_samples_per_level = usl_min_samples_per_level
@@ -173,6 +203,29 @@ class AdaptiveScaler:
         with self._lock:
             return self._usl_alpha, self._usl_beta, self._usl_n_opt
 
+    def consume_bandwidth_cap_update(self) -> tuple[bool, int]:
+        """Return ``(changed, new_cap)`` if the bandwidth ceiling was tightened since
+        the last call, otherwise ``(False, current_cap)``.
+
+        Designed to be polled after each ``should_scale`` call so the caller can
+        emit a log message whenever the learned ceiling changes.  Thread-safe.
+        """
+        with self._lock:
+            effective = min(self._bandwidth_cap, self._crash_ceiling)
+            changed = effective != self._bandwidth_cap_prev
+            self._bandwidth_cap_prev = effective
+            return changed, effective
+
+    def get_bandwidth_cap(self) -> int:
+        """Return the effective bandwidth ceiling: min(dynamic measurement, crash ceiling).
+
+        The dynamic component grows and shrinks with measured throughput; the crash
+        ceiling only decreases (set when a critical error rate triggers a halving).
+        Thread-safe.
+        """
+        with self._lock:
+            return min(self._bandwidth_cap, self._crash_ceiling)
+
     # ------------------------------------------------------------------
     # Readiness
     # ------------------------------------------------------------------
@@ -241,6 +294,15 @@ class AdaptiveScaler:
 
         # Hot path: critical error rate → halve workers
         if window_error_rate >= self._hot_error_rate and current_workers > 2:
+            # Record the pre-halving worker count as the crash ceiling only on the
+            # *first* halving of each cascade.  Subsequent halvings (120→60, 60→30 …)
+            # are recovery mechanics, not new crash events; lowering the ceiling on
+            # every step would lock the scaler at 2-3 workers permanently even after
+            # the network fully recovers.  The ceiling resets when the next successful
+            # scale-up occurs (_in_crash_cascade is cleared in the scale-up path).
+            if not self._in_crash_cascade:
+                self._crash_ceiling = min(self._crash_ceiling, current_workers)
+                self._in_crash_cascade = True
             new_count = max(2, current_workers // 2)
             self._consecutive_headroom_checks = 0
             self._first_scale_done = True
@@ -300,15 +362,34 @@ class AdaptiveScaler:
         headroom = int(total_bw * self._upload_timeout_s / p95_bytes * 0.7) - current_workers
         measured_bw_kbs = int(total_bw / 1024)
 
-        # Phase B — plateau guard: block scale-up if per-connection throughput has
-        # dropped by more than plateau_threshold since the last scale-up event.
-        # Comparing *per-connection* bps (not total) means adding more workers and
-        # naturally seeing higher total throughput doesn't trivially bypass the guard —
-        # only genuine per-connection efficiency surviving the scale-up does.
+        # Update dynamic bandwidth ceiling from current measurements.
+        # headroom + current_workers = int(total_bw × timeout / p95 × 0.7), which is
+        # the theoretical max workers the current bandwidth could sustain.  Bounded by
+        # _crash_ceiling (prevents re-escalation after a prior crash) and configured_max.
+        raw_cap = headroom + current_workers   # == int(total_bw * timeout / p95 * 0.7)
+        self._bandwidth_cap = min(
+            self._crash_ceiling,
+            min(self._configured_max_workers, max(current_workers, raw_cap)),
+        )
+
+        # Phase B — plateau guard: block scale-up if TOTAL throughput across all
+        # workers has dropped by more than plateau_threshold since the last scale-up.
+        #
+        # Using total_bw (= per_conn_bw × current_workers) as the comparison metric
+        # avoids false positives on shared-bandwidth links.  When bandwidth is shared,
+        # doubling workers halves per_conn naturally — a per_conn comparison would fire
+        # on every scale-up step even though total throughput is still growing.  Only
+        # compare total_bw so the guard fires exclusively on genuine saturation (total
+        # throughput falling after a scale-up event, not just spreading across workers).
         if (
             self._last_scale_up_bps > 0
-            and per_conn_bw < self._last_scale_up_bps * (1.0 - self._plateau_threshold)
+            and total_bw < self._last_scale_up_bps * (1.0 - self._plateau_threshold)
         ):
+            # Per-connection throughput dropped after the last scale-up — pause here
+            # until it stabilises.  Do NOT tighten _bandwidth_cap here: this guard
+            # fires on transient jitter too (e.g. a TCP-connection burst when new
+            # threads start), and permanently capping at current_workers would prevent
+            # any further scale-up even after the jitter clears.
             self._consecutive_headroom_checks = 0
             return current_workers, ""
 
@@ -325,13 +406,14 @@ class AdaptiveScaler:
                 # Slow-start: never jump by more than the current worker count or
                 # up_max_step in one shot (replaces the old "jump to full headroom").
                 step = min(headroom, max(1, min(current_workers, self._up_max_step)))
-                formula_target = min(self._configured_max_workers, current_workers + step)
+                formula_target = min(self._bandwidth_cap, current_workers + step)
                 reason_base = f"slow-start +{step} ({measured_bw_kbs} KB/s, {headroom} slots headroom)"
                 new_count, reason = self._apply_usl_ceiling(
                     current_workers, formula_target, reason_base, measured_bw_kbs
                 )
                 if new_count > current_workers:
-                    self._last_scale_up_bps = per_conn_bw
+                    self._last_scale_up_bps = total_bw
+                    self._in_crash_cascade = False  # recovery confirmed
                     return new_count, reason
             return current_workers, ""
 
@@ -339,13 +421,14 @@ class AdaptiveScaler:
         if self._consecutive_headroom_checks >= self._up_confirm_checks:
             self._consecutive_headroom_checks = 0
             step = min(headroom, self._up_max_step)
-            formula_target = min(self._configured_max_workers, current_workers + step)
+            formula_target = min(self._bandwidth_cap, current_workers + step)
             reason_base = f"{measured_bw_kbs} KB/s, {headroom} slots headroom"
             new_count, reason = self._apply_usl_ceiling(
                 current_workers, formula_target, reason_base, measured_bw_kbs
             )
             if new_count > current_workers:
-                self._last_scale_up_bps = per_conn_bw
+                self._last_scale_up_bps = total_bw
+                self._in_crash_cascade = False  # recovery confirmed
                 return new_count, reason
 
         return current_workers, ""

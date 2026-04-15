@@ -10,6 +10,8 @@ import sys
 from datetime import datetime, timedelta
 from time import perf_counter
 
+import psutil
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
@@ -39,7 +41,18 @@ from gui.system_monitor_worker import SystemMonitorWorker
 from gui.workers import SchemaLoaderWorker, TransformWorker, _format_bytes
 from parquet_transform.checkpoint import FailedList, RunCheckpoint
 
-MAX_WORKERS = 256
+# Derive a sensible worker cap from available RAM.
+# Each active worker holds roughly 80 MB in-flight:
+#   ~24 MB input download buffer  +  PyArrow table in memory  +  ~10 MB zstd output buffer.
+# Reserve 2 GB for the OS and the application itself.
+# Hard ceiling: 512 (OS scheduler overhead becomes significant beyond that; network
+# is always the real bottleneck long before RAM runs out on a typical dev machine).
+_BYTES_PER_WORKER: int = 80 * 1024 * 1024   # 80 MB
+_RAM_RESERVE: int      = 2 * 1024 * 1024 * 1024  # 2 GB
+MAX_WORKERS: int = max(4, min(512, int(
+    (psutil.virtual_memory().total - _RAM_RESERVE) / _BYTES_PER_WORKER
+)))
+
 DEFAULT_MAX_ATTEMPTS = 5
 MAX_LOG_ENTRIES = 5_000
 """Maximum number of log lines kept in memory. Oldest entries are dropped first."""
@@ -254,6 +267,15 @@ class MainWindow(QMainWindow):
         self._worker_spin.setValue(self._default_worker_count())
         self._worker_spin.setToolTip("Number of parallel worker threads")
 
+        _ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+        self._max_workers_label = QLabel(f"/ {MAX_WORKERS}")
+        self._max_workers_label.setToolTip(
+            f"Hard cap derived from available RAM.\n"
+            f"System RAM: {_ram_gb:.0f} GB  ·  ~80 MB reserved per worker  ·  2 GB for OS\n"
+            f"→ max {MAX_WORKERS} parallel workers\n\n"
+            f"The autoscaler will stay well below this based on measured network bandwidth."
+        )
+
         self._autoscale_check = QCheckBox("Auto-Scale")
         self._autoscale_check.setToolTip(
             "Automatically calibrate the worker count based on measured upload bandwidth.\n"
@@ -303,6 +325,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(worker_label)
         layout.addWidget(self._worker_spin)
+        layout.addWidget(self._max_workers_label)
         layout.addWidget(self._autoscale_check)
         layout.addSpacing(12)
         layout.addWidget(attempts_label)
@@ -423,7 +446,10 @@ class MainWindow(QMainWindow):
         self._cancel_btn.setEnabled(False)
         self._progress.setVisible(False)
         self._throughput_label.setText("")
+        self._schema_table.setEnabled(True)
         self._is_paused = False
+        # Reset bandwidth cap label — no live measurement outside a run
+        self._max_workers_label.setText(f"/ {MAX_WORKERS}")
 
     def _set_processing_state(self) -> None:
         self._load_btn.setEnabled(False)
@@ -435,6 +461,7 @@ class MainWindow(QMainWindow):
         self._cancel_btn.setEnabled(True)
         self._progress.setValue(0)
         self._progress.setVisible(True)
+        self._schema_table.setEnabled(False)
         self._is_paused = False
 
     # ------------------------------------------------------------------
@@ -816,6 +843,7 @@ class MainWindow(QMainWindow):
         self._transform_worker.throughput_update.connect(
             self._resources_panel.update_worker_throughput
         )
+        self._transform_worker.bandwidth_cap_changed.connect(self._on_bandwidth_cap_changed)
         self._transform_worker.start()
 
     # ------------------------------------------------------------------
@@ -1033,6 +1061,10 @@ class MainWindow(QMainWindow):
         self._log_info(
             f"[Autoscale {arrow}] {old_count}→{new_count} workers — {reason}"
         )
+
+    def _on_bandwidth_cap_changed(self, bw_cap: int) -> None:
+        """Update the max-workers label with both the live bandwidth cap and the RAM cap."""
+        self._max_workers_label.setText(f"/ {bw_cap} bw · {MAX_WORKERS} ram")
 
     def _on_workers_reduced(self, new_count: int, conn_errors: int) -> None:
         self._worker_spin.setValue(new_count)

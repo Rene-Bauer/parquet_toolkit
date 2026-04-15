@@ -223,13 +223,20 @@ def test_no_scale_up_when_no_headroom():
 
 
 def test_plateau_guard_blocks_second_jump_after_saturation():
-    """After a scale-up from 2→10, a saturated 10-worker run (low per-conn bps)
-    must not immediately be allowed to jump to 18 workers.
+    """After a scale-up from N=2→4, a saturated run where total throughput drops
+    must be blocked by the plateau guard.
 
-    Root-cause of the 2→10→18 cascade bug: the old guard compared *total* bps
-    at N=10 against *total* bps at N=2.  With 5× more workers total throughput
-    naturally grows 5×, trivially passing the 5% threshold.  The new guard
-    compares *per-connection* bps, which drops under saturation.
+    The guard compares *total* bps (per_conn × N).  True saturation is when the
+    link is fully loaded and adding workers causes total throughput to fall — not
+    merely per-connection throughput halving while total grows (which is normal
+    shared-bandwidth behaviour).
+
+    Threshold arithmetic (plateau_threshold=0.05):
+      At N=2, slow-start records per_conn=1 MB/s → _last_total_bw = 2 MB/s.
+      Guard fires when: total_bw < 2 MB/s × 0.95 = 1.9 MB/s
+                    i.e. per_conn at N=4 < 475 KB/s.
+      10 baseline (1 MB/s) + 15 saturated (100 KB/s):
+        per_conn = (50+7.5) MB / (50+75) s ≈ 460 KB/s → total = 1.84 MB/s < 1.9 ✓
     """
     scaler = _make_scaler(
         min_samples=5,
@@ -242,23 +249,31 @@ def test_plateau_guard_blocks_second_jump_after_saturation():
     _fill_scaler_with_good_uploads(scaler, 10, bytes_=5_000_000, seconds=5.0)
 
     # First check at N=2 → slow-start to N=4 (step = min(82, min(2,8)) = 2)
+    # _last_scale_up_bps = total_bw at N=2 = 1 MB/s × 2 = 2 MB/s
     new_count_0, _ = scaler.should_scale(2, 5_000_000)
     assert new_count_0 == 4
 
-    # Simulate saturation: per-connection throughput has halved (500 KB/s instead of 1 MB/s)
-    for _ in range(10):
-        scaler.record_upload(2_500_000, 5.0, True)  # 500 KB/s each
+    # Simulate true saturation: total throughput drops (link fully loaded, new workers
+    # introduce contention overhead that reduces throughput below the N=2 baseline)
+    for _ in range(15):
+        scaler.record_upload(500_000, 5.0, True)  # 100 KB/s each → per_conn ≈ 460 KB/s
 
-    # Plateau guard must fire: per_conn (500 KB/s) < last_per_conn (1 MB/s) × 0.95
+    # Plateau guard must fire: total_bw (≈1.84 MB/s) < _last (2 MB/s) × 0.95 = 1.9 MB/s
     new_count_1, reason_1 = scaler.should_scale(new_count_0, 5_000_000)
     assert new_count_1 == new_count_0, (
         f"Expected plateau guard to block scale-up, got {new_count_0}→{new_count_1} ({reason_1!r})"
     )
 
 
-def test_plateau_guard_allows_scale_up_when_per_conn_stable():
-    """When per-connection throughput stays flat after a scale-up (no saturation),
+def test_plateau_guard_allows_scale_up_when_total_bw_grows():
+    """When total throughput grows after a scale-up (bandwidth scales with workers),
     the plateau guard must NOT block the next scale-up.
+
+    On a shared link per-connection throughput halves when doubling workers, but
+    total_bw stays roughly constant — well above the (1 − plateau_threshold) threshold
+    because _last_total_bw was recorded at the lower worker count.
+    Here uploads are constant (1 MB/s per conn) so total_bw doubles: 2 MB/s → 4 MB/s,
+    which is clearly above 0.95 × 2 MB/s = 1.9 MB/s.
     """
     scaler = _make_scaler(
         min_samples=5,
@@ -280,4 +295,148 @@ def test_plateau_guard_allows_scale_up_when_per_conn_stable():
     new_count_1, _ = scaler.should_scale(new_count_0, 5_000_000)
     assert new_count_1 > new_count_0, (
         f"Expected scale-up from {new_count_0}, got {new_count_1}"
+    )
+
+
+def test_bandwidth_cap_not_set_by_plateau_guard():
+    """Plateau guard blocking a scale-up must NOT permanently lower _bandwidth_cap.
+
+    Scenario: total throughput dips transiently after a scale-up (e.g. a brief
+    TCP-connection burst when new threads start together).  The plateau guard
+    correctly pauses the next scale-up, but the bandwidth ceiling must remain at
+    configured_max so the scaler can continue once the transient clears.
+
+    Threshold arithmetic (plateau_threshold=0.05):
+      At N=2 slow-start: _last_total_bw = 1 MB/s × 2 = 2 MB/s.
+      Guard fires when total_bw < 2 MB/s × 0.95 = 1.9 MB/s.
+      10 baseline (1 MB/s) + 15 jitter (100 KB/s):
+        per_conn ≈ 460 KB/s → total at N=4 = 1.84 MB/s < 1.9 ✓ guard fires.
+      But _bandwidth_cap is updated from raw measurements before the guard runs,
+      so the ceiling must still reflect the full measured capacity (configured_max).
+    """
+    scaler = _make_scaler(
+        min_samples=5,
+        up_confirm_checks=1,
+        up_max_step=8,
+        configured_max_workers=32,
+        plateau_threshold=0.05,
+    )
+    # Baseline at high throughput
+    _fill_scaler_with_good_uploads(scaler, 10, bytes_=5_000_000, seconds=5.0)
+
+    # Slow-start: 2 → 4
+    new_count_0, _ = scaler.should_scale(2, 5_000_000)
+    assert new_count_0 == 4
+
+    # Inject jitter records that drop total_bw below the guard threshold.
+    # 10 baseline (1 MB/s) + 15 jitter (100 KB/s):
+    #   per_conn = (50 + 7.5) MB / (50 + 75) s ≈ 460 KB/s → total = 1.84 MB/s < 1.9 ✓
+    for _ in range(15):
+        scaler.record_upload(500_000, 5.0, True)  # 100 KB/s
+
+    # Plateau guard must fire — but cap must remain at configured max (32)
+    new_count_1, _ = scaler.should_scale(new_count_0, 5_000_000)
+    assert new_count_1 == new_count_0   # blocked — correct
+    assert scaler.get_bandwidth_cap() == 32  # cap unchanged — no permanent lock-in
+
+
+def test_bandwidth_cap_set_by_critical_error_halving():
+    """A critical error rate (>=50%) must lock _bandwidth_cap at the pre-halving
+    worker count so the scaler won't re-escalate above it after recovery.
+    """
+    scaler = _make_scaler(
+        min_samples=5,
+        up_confirm_checks=1,
+        configured_max_workers=32,
+    )
+    _fill_scaler_with_good_uploads(scaler, 5, bytes_=5_000_000, seconds=5.0)
+
+    # Critical error rate at 20 workers → halve to 10, cap locked at 20
+    for _ in range(5):
+        scaler.record_upload(0, 0.0, False)  # 50% errors → critical
+    new_count, reason = scaler.should_scale(20, 5_000_000)
+    assert new_count == 10               # halved
+    assert "critical" in reason.lower() or "halving" in reason.lower()
+    assert scaler.get_bandwidth_cap() == 20  # ceiling locked at pre-halving count
+
+    # After recovery: scaler must not scale above 20 (the learned ceiling)
+    _fill_scaler_with_good_uploads(scaler, 50, bytes_=5_000_000, seconds=5.0)
+    # With configured_max=32 and cap=20, formula_target is bounded by cap
+    new_count_recovery, _ = scaler.should_scale(10, 5_000_000)
+    assert new_count_recovery <= 20, (
+        f"Scaler exceeded learned ceiling: went to {new_count_recovery}"
+    )
+
+
+def test_crash_cascade_ceiling_locked_at_first_halving():
+    """When a cascade of halvings occurs (240→120→60→30→…), the crash ceiling must
+    be set at the FIRST halving only (240), not lowered on every subsequent halving.
+    If it cascaded, the ceiling would end up at 2-3 and block all scale-up after
+    recovery — exactly the bug seen in production.
+
+    Uses a small window (window_size=20, min_samples=5) so that 20 clean recovery
+    records are enough to push the error rate below 5% and allow scale-up.
+    """
+    scaler = _make_scaler(
+        min_samples=5,
+        window_size=20,
+        up_confirm_checks=1,
+        configured_max_workers=256,
+    )
+    # Seed window: 5 good + 5 bad = 50% errors → critical
+    _fill_scaler_with_good_uploads(scaler, 5, bytes_=5_000_000, seconds=5.0)
+    for _ in range(5):
+        scaler.record_upload(0, 0.0, False)
+
+    # First halving: 240 → 120 — crash ceiling must be set to 240
+    workers = 240
+    workers, _ = scaler.should_scale(workers, 5_000_000)
+    assert workers == 120
+    assert scaler.get_bandwidth_cap() == 240, (
+        f"Ceiling after first halving should be 240, got {scaler.get_bandwidth_cap()}"
+    )
+
+    # Second halving: still ≥50% errors, 120 → 60 — ceiling must STAY at 240
+    for _ in range(5):
+        scaler.record_upload(0, 0.0, False)
+    workers, _ = scaler.should_scale(workers, 5_000_000)
+    assert workers == 60
+    assert scaler.get_bandwidth_cap() == 240, (
+        f"Ceiling after second halving cascaded down to {scaler.get_bandwidth_cap()} (bug)"
+    )
+
+    # Third halving: 60 → 30 — ceiling must STAY at 240
+    for _ in range(5):
+        scaler.record_upload(0, 0.0, False)
+    workers, _ = scaler.should_scale(workers, 5_000_000)
+    assert workers == 30
+    assert scaler.get_bandwidth_cap() == 240, (
+        f"Ceiling after third halving cascaded down to {scaler.get_bandwidth_cap()} (bug)"
+    )
+
+    # Flush the error window with 20 clean records (window_size=20, so all errors
+    # are evicted).  Error rate drops to 0% → below recovery_error_ceiling (5%).
+    _fill_scaler_with_good_uploads(scaler, 20, bytes_=5_000_000, seconds=5.0)
+
+    # Scaler must now be able to scale back up.  With crash_ceiling=240 and a
+    # healthy window, formula_target will be >2.  The previous ceiling-cascade bug
+    # would have left _crash_ceiling=30 (or lower), then dynamic_cap = min(30, 84) = 30,
+    # making formula_target = min(30, 2+step) = 4 which > 2 — but at deeper cascade
+    # levels (ceiling=3) formula_target = min(3, 2+step) = 3 which > 2 still...
+    # The real regression is ceiling=3 when current_workers=3 → can never go to 4+.
+    # So let's test from 3 workers, where the bug manifests fully:
+    new_count_from_3, _ = scaler.should_scale(3, 5_000_000)
+    assert new_count_from_3 > 3, (
+        f"Scaler stuck at 3 workers after recovery — crash ceiling cascaded too low "
+        f"(_crash_ceiling should be 240 but effective cap={scaler.get_bandwidth_cap()})"
+    )
+    # The effective cap is min(dynamic_measurement, _crash_ceiling).
+    # dynamic_measurement at 3 workers × 1 MB/s = 3 MB/s → raw_cap = int(3M*300/5M*0.7)=126.
+    # With _crash_ceiling=240 the cap should be min(240, 126)=126.
+    # If _crash_ceiling had cascaded to 30, the cap would be min(30, 126)=30.
+    # Either way scale-up from 3 works as long as crash_ceiling > 3.
+    # Verify the crash ceiling is bounded away from 3:
+    assert scaler.get_bandwidth_cap() > 3, (
+        f"Effective bandwidth cap is {scaler.get_bandwidth_cap()} — "
+        "crash ceiling cascaded down to 3 (the scale-up-blocking level)"
     )
