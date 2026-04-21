@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import queue
 import threading
+import time
 import traceback
 from dataclasses import dataclass
 from time import perf_counter
@@ -907,17 +908,22 @@ class TransformWorker(QThread):
 
 class DataCollectorWorker(QThread):
     """
-    Downloads all Parquet blobs under source_prefix from Azure, filters rows
-    by filter_col matching any of filter_values, combines all matches into one
-    table, recalculates metadata, and uploads a single output file.
+    Parallel producer-consumer collector.
+
+    N producer threads download and filter Parquet blobs from Azure.
+    One writer thread accumulates filtered chunks and flushes to a local
+    temp file via ParquetWriter when the RAM buffer reaches ram_limit_mb.
+    After all producers finish the temp file is rewritten with recalculated
+    metadata, uploaded to Azure, and the temp files are deleted.
     """
 
-    listing_complete = pyqtSignal(int)       # total blob count found
-    progress = pyqtSignal(int, int, str)     # (completed, total, blob_name)
-    file_error = pyqtSignal(str, str)        # (blob_name, error_message)
-    finished = pyqtSignal(dict)              # {"rowCount": int, "outputBlob": str} or {"rowCount": 0}
+    listing_complete = pyqtSignal(int)
+    progress = pyqtSignal(int, int, str)
+    file_error = pyqtSignal(str, str)
+    finished = pyqtSignal(dict)
     cancelled = pyqtSignal()
     log_message = pyqtSignal(str)
+    workers_scaled = pyqtSignal(int, int, str, str)
 
     def __init__(
         self,
@@ -927,6 +933,10 @@ class DataCollectorWorker(QThread):
         output_prefix: str,
         filter_col: str,
         filter_values: list[str],
+        output_container: str = "",
+        max_workers: int = 4,
+        ram_limit_mb: int = 1024,
+        autoscale: bool = True,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -936,45 +946,251 @@ class DataCollectorWorker(QThread):
         self._output_prefix = output_prefix
         self._filter_col = filter_col
         self._filter_values = filter_values
+        self._output_container = output_container or container
+        self._max_workers = max_workers
+        self._ram_limit_bytes = ram_limit_mb * 1024 * 1024
+        self._autoscale = autoscale
+        self._worker_count = max_workers
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
         self._cancel_event.set()
 
     def run(self) -> None:
+        import os
+        import tempfile
         from parquet_transform.collector import (
             filter_table_by_ids,
-            build_metadata,
             make_output_blob_name,
+            MetadataAccumulator,
+            rewrite_with_metadata,
+        )
+        from parquet_transform.scaler import CollectorScaler
+
+        source_client = BlobStorageClient(self._conn, self._container_name)
+        output_client = (
+            source_client
+            if self._output_container == self._container_name
+            else BlobStorageClient(self._conn, self._output_container)
         )
 
-        client = BlobStorageClient(self._conn, self._container_name)
+        tmp1_path: str | None = None
+        tmp2_path: str | None = None
+        writer_ref: list = [None]
+
         try:
-            blobs = client.list_blobs(self._source_prefix)
-            self.listing_complete.emit(len(blobs))
+            blobs = source_client.list_blobs(self._source_prefix)
+            total = len(blobs)
+            self.listing_complete.emit(total)
 
-            chunks: list[pa.Table] = []
+            if not blobs:
+                self.finished.emit({"rowCount": 0})
+                return
 
-            for idx, blob_name in enumerate(blobs):
-                if self._cancel_event.is_set():
-                    self.cancelled.emit()
-                    return
+            # ── Shared state ──────────────────────────────────────────────
+            task_queue: queue.Queue = queue.Queue()
+            for b in blobs:
+                task_queue.put(b)
+
+            chunk_queue: queue.Queue = queue.Queue()
+
+            completed = [0]
+            completed_lock = threading.Lock()
+
+            ram_used = [0]
+            ram_lock = threading.Lock()
+
+            # Errors from producer threads are buffered here and emitted on
+            # the main (run) thread to ensure PyQt signal delivery.
+            error_queue: queue.Queue = queue.Queue()
+
+            meta_acc = MetadataAccumulator()
+
+            tmp1_fd, tmp1_path = tempfile.mkstemp(suffix=".parquet")
+            os.close(tmp1_fd)
+
+            writer_stop = threading.Event()
+            writer_error: list = [None]
+
+            # ── Writer thread ─────────────────────────────────────────────
+            def _writer_loop() -> None:
                 try:
-                    raw = client.download_bytes(blob_name, timeout=DOWNLOAD_TIMEOUT_S)
-                    table = pq.read_table(io.BytesIO(raw))
-                    filtered = filter_table_by_ids(table, self._filter_col, self._filter_values)
-                    if filtered.num_rows > 0:
-                        chunks.append(filtered)
-                except Exception as exc:
-                    msg, _, _ = _summarize_exception(exc)
-                    self.file_error.emit(blob_name, msg)
-                self.progress.emit(idx + 1, len(blobs), blob_name)
+                    while True:
+                        try:
+                            chunk = chunk_queue.get(timeout=0.2)
+                        except queue.Empty:
+                            if writer_stop.is_set() and chunk_queue.empty():
+                                break
+                            continue
+                        if chunk is None:
+                            break
+                        meta_acc.update(chunk)
+                        if writer_ref[0] is None:
+                            writer_ref[0] = pq.ParquetWriter(
+                                tmp1_path, chunk.schema,
+                                compression="zstd", compression_level=3,
+                            )
+                        writer_ref[0].write_table(chunk)
+                        with ram_lock:
+                            ram_used[0] = max(0, ram_used[0] - chunk.nbytes)
+                except Exception as exc:  # noqa: BLE001
+                    writer_error[0] = str(exc)
+
+            writer_thread = threading.Thread(target=_writer_loop, daemon=True)
+            writer_thread.start()
+
+            # ── Producer worker function ───────────────────────────────────
+            _exit_requested = [0]
+            _exit_lock = threading.Lock()
+            _threads: list[threading.Thread] = []
+            _threads_lock = threading.Lock()
+            _next_id = [1]
+
+            scaler = (
+                CollectorScaler(max_workers=self._max_workers)
+                if self._autoscale else None
+            )
+
+            def _producer(wid: int) -> None:
+                client = BlobStorageClient(self._conn, self._container_name)
+                try:
+                    while not self._cancel_event.is_set():
+                        with _exit_lock:
+                            if _exit_requested[0] > 0:
+                                _exit_requested[0] -= 1
+                                return
+                        try:
+                            blob_name = task_queue.get_nowait()
+                        except queue.Empty:
+                            return
+                        try:
+                            t0 = time.monotonic()
+                            raw = client.download_bytes(blob_name, timeout=DOWNLOAD_TIMEOUT_S)
+                            dl_s = time.monotonic() - t0
+                            table = pq.read_table(io.BytesIO(raw))
+                            filtered = filter_table_by_ids(
+                                table, self._filter_col, self._filter_values
+                            )
+                            if scaler is not None:
+                                scaler.record_download(len(raw), dl_s, True)
+                            if filtered.num_rows > 0:
+                                with ram_lock:
+                                    ram_used[0] += filtered.nbytes
+                                while not self._cancel_event.is_set():
+                                    try:
+                                        chunk_queue.put(filtered, timeout=0.5)
+                                        break
+                                    except queue.Full:
+                                        continue
+                        except Exception as exc:
+                            msg, _, _ = _summarize_exception(exc)
+                            error_queue.put((blob_name, msg))
+                            if scaler is not None:
+                                scaler.record_download(0, 0.0, False)
+                        finally:
+                            with completed_lock:
+                                completed[0] += 1
+                                done = completed[0]
+                            self.progress.emit(done, total, blob_name)
+                finally:
+                    client.close()
+
+            def _spawn(count: int) -> None:
+                for _ in range(count):
+                    wid = _next_id[0]
+                    _next_id[0] += 1
+                    t = threading.Thread(target=_producer, args=(wid,), daemon=True)
+                    with _threads_lock:
+                        _threads.append(t)
+                    t.start()
+
+            _spawn(self._worker_count)
+
+            # ── Main coordination loop ────────────────────────────────────
+            _scale_ticks = [0]
+            SCALE_INTERVAL = 5
+
+            while True:
+                if self._cancel_event.is_set():
+                    while not task_queue.empty():
+                        try:
+                            task_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                    break
+
+                with completed_lock:
+                    done = completed[0]
+                if done >= total:
+                    break
+
+                # Drain file errors on the main thread for correct Qt signal delivery
+                while not error_queue.empty():
+                    try:
+                        _blob, _msg = error_queue.get_nowait()
+                        self.file_error.emit(_blob, _msg)
+                    except queue.Empty:
+                        break
+
+                if scaler is not None:
+                    _scale_ticks[0] += 1
+                    if _scale_ticks[0] >= SCALE_INTERVAL:
+                        _scale_ticks[0] = 0
+                        with ram_lock:
+                            current_ram = ram_used[0]
+                        new_count, reason = scaler.should_scale(
+                            self._worker_count, current_ram, self._ram_limit_bytes
+                        )
+                        if new_count != self._worker_count:
+                            old = self._worker_count
+                            self._worker_count = new_count
+                            direction = "up" if new_count > old else "down"
+                            self.workers_scaled.emit(new_count, old, direction, reason)
+                            self.log_message.emit(
+                                f"[Collector] Workers {old}→{new_count}: {reason}"
+                            )
+                            if new_count > old:
+                                _spawn(new_count - old)
+                            else:
+                                with _exit_lock:
+                                    _exit_requested[0] += old - new_count
+
+                time.sleep(0.05)
+
+            # Wait for all producers
+            with _threads_lock:
+                all_threads = list(_threads)
+            for t in all_threads:
+                t.join(timeout=5.0)
+
+            # Final drain of any errors buffered during the last tick
+            while not error_queue.empty():
+                try:
+                    _blob, _msg = error_queue.get_nowait()
+                    self.file_error.emit(_blob, _msg)
+                except queue.Empty:
+                    break
 
             if self._cancel_event.is_set():
+                chunk_queue.put(None)
+                writer_thread.join(timeout=5.0)
                 self.cancelled.emit()
                 return
 
-            if not chunks:
+            # Stop writer
+            writer_stop.set()
+            writer_thread.join(timeout=60.0)
+
+            if writer_error[0]:
+                self.log_message.emit(f"Data-Collector writer error: {writer_error[0]}")
+                self.finished.emit({"rowCount": 0})
+                return
+
+            if writer_ref[0] is not None:
+                writer_ref[0].close()
+                writer_ref[0] = None
+
+            if meta_acc.total_rows == 0:
                 self.log_message.emit(
                     f"Data-Collector: no rows matched "
                     f"{self._filter_col} {self._filter_values}"
@@ -982,30 +1198,42 @@ class DataCollectorWorker(QThread):
                 self.finished.emit({"rowCount": 0})
                 return
 
-            merged = pa.concat_tables(chunks)
-            meta = build_metadata(merged)
+            # Rewrite temp file with recalculated metadata (streaming, bounded RAM)
+            final_meta = meta_acc.to_metadata()
+            tmp2_fd, tmp2_path = tempfile.mkstemp(suffix=".parquet")
+            os.close(tmp2_fd)
+            rewrite_with_metadata(tmp1_path, tmp2_path, final_meta)
 
-            # Preserve existing metadata keys, overwrite recalculated ones
-            existing = merged.schema.metadata or {}
-            decoded = {
-                (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
-                for k, v in existing.items()
-            }
-            decoded.update(meta)
-            merged = merged.replace_schema_metadata(decoded)
-
-            out_buf = io.BytesIO()
-            pq.write_table(merged, out_buf, compression="zstd", compression_level=3)
+            # Upload
+            with open(tmp2_path, "rb") as fh:
+                data = fh.read()
 
             out_name = make_output_blob_name(
                 self._output_prefix, self._filter_col, self._filter_values
             )
-            client.upload_bytes(out_name, out_buf.getvalue(), overwrite=True,
-                                timeout=UPLOAD_TIMEOUT_S)
+            output_client.upload_bytes(out_name, data, overwrite=True, timeout=UPLOAD_TIMEOUT_S)
             self.log_message.emit(
-                f"Data-Collector: uploaded {out_name} ({merged.num_rows} rows)"
+                f"Data-Collector: uploaded {out_name} → "
+                f"{self._output_container} ({meta_acc.total_rows} rows)"
             )
-            self.finished.emit({"rowCount": merged.num_rows, "outputBlob": out_name})
+            self.finished.emit({
+                "rowCount": meta_acc.total_rows,
+                "outputBlob": out_name,
+                "outputContainer": self._output_container,
+            })
 
         finally:
-            client.close()
+            if writer_ref[0] is not None:
+                try:
+                    writer_ref[0].close()
+                except Exception:
+                    pass
+            source_client.close()
+            if output_client is not source_client:
+                output_client.close()
+            for p in (tmp1_path, tmp2_path):
+                if p is not None:
+                    try:
+                        os.unlink(p)
+                    except Exception:
+                        pass
