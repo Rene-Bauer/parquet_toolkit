@@ -1,7 +1,6 @@
 """Self-contained Data-Collector panel widget."""
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -197,12 +196,18 @@ class CollectorPanel(QWidget):
             self._log_info(
                 f"Collection complete: {row_count} rows → {out_blob}"
             )
+        if self._worker is not None:
+            self._worker.deleteLater()
+            self._worker = None
 
     def _on_cancelled(self) -> None:
         self._collect_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
         self._progress.setVisible(False)
         self._log_info("Collection cancelled.")
+        if self._worker is not None:
+            self._worker.deleteLater()
+            self._worker = None
 
     # ------------------------------------------------------------------
     # Logging helpers

@@ -165,3 +165,33 @@ def test_worker_no_match_skips_upload():
 
     assert results["rowCount"] == 0
     assert mock_client.upload_bytes.call_count == 0
+
+
+def test_worker_emits_file_error_on_bad_blob_and_continues():
+    from gui.workers import DataCollectorWorker
+
+    mock_client = MagicMock()
+    mock_client.list_blobs.return_value = ["prefix/bad.parquet", "prefix/good.parquet"]
+    mock_client.download_bytes.side_effect = [
+        Exception("simulated download failure"),
+        _make_parquet_bytes("uid1", "dev1", 3),
+    ]
+
+    errors = []
+    with patch("gui.workers.BlobStorageClient", return_value=mock_client):
+        worker = DataCollectorWorker(
+            connection_string="fake",
+            container="c",
+            source_prefix="prefix/",
+            output_prefix="out/",
+            filter_col="SenderUid",
+            filter_values=["uid1"],
+        )
+        worker.file_error.connect(lambda blob, err: errors.append((blob, err)))
+        results = _run_worker(worker)
+
+    # Bad blob emits file_error but run continues; good blob rows are collected
+    assert len(errors) == 1
+    assert errors[0][0] == "prefix/bad.parquet"
+    assert results["rowCount"] == 3
+    assert mock_client.upload_bytes.call_count == 1
