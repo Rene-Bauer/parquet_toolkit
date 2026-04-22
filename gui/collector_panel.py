@@ -105,11 +105,10 @@ class CollectorPanel(QWidget):
         self._workers_spin.setFixedWidth(60)
         row3.addWidget(self._workers_spin)
         self._autoscale_check = QCheckBox("Autoscale")
-        self._autoscale_check.setChecked(True)
-        self._workers_spin.setEnabled(False)   # disabled when autoscale on
         self._autoscale_check.toggled.connect(
             lambda checked: self._workers_spin.setEnabled(not checked)
         )
+        self._autoscale_check.setChecked(True)  # fires toggled(True) → slot disables spin
         row3.addWidget(self._autoscale_check)
         row3.addSpacing(16)
         row3.addWidget(QLabel("RAM limit (MB):"))
