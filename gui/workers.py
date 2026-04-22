@@ -967,13 +967,8 @@ class DataCollectorWorker(QThread):
         )
         from parquet_transform.scaler import CollectorScaler
 
-        source_client = BlobStorageClient(self._conn, self._container_name)
-        output_client = (
-            source_client
-            if self._output_container == self._container_name
-            else BlobStorageClient(self._conn, self._output_container)
-        )
-
+        source_client = None
+        output_client = None
         tmp1_path: str | None = None
         tmp2_path: str | None = None
         writer_ref: list = [None]
@@ -981,6 +976,12 @@ class DataCollectorWorker(QThread):
         writer_thread: threading.Thread | None = None
 
         try:
+            source_client = BlobStorageClient(self._conn, self._container_name)
+            output_client = (
+                source_client
+                if self._output_container == self._container_name
+                else BlobStorageClient(self._conn, self._output_container)
+            )
             blobs = source_client.list_blobs(self._source_prefix)
             total = len(blobs)
             self.listing_complete.emit(total)
@@ -1036,6 +1037,7 @@ class DataCollectorWorker(QThread):
                             ram_used[0] = max(0, ram_used[0] - chunk.nbytes)
                 except Exception as exc:  # noqa: BLE001
                     writer_error[0] = str(exc)
+                    self._cancel_event.set()  # unblock producers waiting on full chunk_queue
 
             writer_thread = threading.Thread(target=_writer_loop, daemon=True)
             writer_thread.start()
@@ -1240,8 +1242,9 @@ class DataCollectorWorker(QThread):
                     writer_ref[0].close()
                 except Exception:
                     pass
-            source_client.close()
-            if output_client is not source_client:
+            if source_client is not None:
+                source_client.close()
+            if output_client is not None and output_client is not source_client:
                 output_client.close()
             for p in (tmp1_path, tmp2_path):
                 if p is not None:
