@@ -977,6 +977,8 @@ class DataCollectorWorker(QThread):
         tmp1_path: str | None = None
         tmp2_path: str | None = None
         writer_ref: list = [None]
+        writer_stop = threading.Event()
+        writer_thread: threading.Thread | None = None
 
         try:
             blobs = source_client.list_blobs(self._source_prefix)
@@ -992,7 +994,7 @@ class DataCollectorWorker(QThread):
             for b in blobs:
                 task_queue.put(b)
 
-            chunk_queue: queue.Queue = queue.Queue()
+            chunk_queue: queue.Queue = queue.Queue(maxsize=64)
 
             completed = [0]
             completed_lock = threading.Lock()
@@ -1009,7 +1011,6 @@ class DataCollectorWorker(QThread):
             tmp1_fd, tmp1_path = tempfile.mkstemp(suffix=".parquet")
             os.close(tmp1_fd)
 
-            writer_stop = threading.Event()
             writer_error: list = [None]
 
             # ── Writer thread ─────────────────────────────────────────────
@@ -1044,7 +1045,7 @@ class DataCollectorWorker(QThread):
             _exit_lock = threading.Lock()
             _threads: list[threading.Thread] = []
             _threads_lock = threading.Lock()
-            _next_id = [1]
+            _next_id = [1]  # only mutated from coordination loop (single thread)
 
             scaler = (
                 CollectorScaler(max_workers=self._max_workers)
@@ -1091,6 +1092,8 @@ class DataCollectorWorker(QThread):
                             with completed_lock:
                                 completed[0] += 1
                                 done = completed[0]
+                            # progress is safe to emit from threads (Qt queued delivery)
+                            # file_error uses error_queue to guarantee delivery without an event loop
                             self.progress.emit(done, total, blob_name)
                 finally:
                     client.close()
@@ -1180,6 +1183,10 @@ class DataCollectorWorker(QThread):
             # Stop writer
             writer_stop.set()
             writer_thread.join(timeout=60.0)
+            if writer_thread.is_alive():
+                self.log_message.emit("Data-Collector writer thread timed out — aborting")
+                self.finished.emit({"rowCount": 0})
+                return
 
             if writer_error[0]:
                 self.log_message.emit(f"Data-Collector writer error: {writer_error[0]}")
@@ -1223,6 +1230,11 @@ class DataCollectorWorker(QThread):
             })
 
         finally:
+            # Signal and join writer thread before closing/unlinking to avoid
+            # racing with an open file handle on Windows.
+            writer_stop.set()
+            if writer_thread is not None and writer_thread.is_alive():
+                writer_thread.join(timeout=5.0)
             if writer_ref[0] is not None:
                 try:
                     writer_ref[0].close()
