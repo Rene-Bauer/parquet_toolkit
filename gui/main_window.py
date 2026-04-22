@@ -165,7 +165,8 @@ class MainWindow(QMainWindow):
         tabs.addTab(transformer_widget, "Schema Transformer")
 
         # --- Tab 2: Data Collector ---
-        tabs.addTab(CollectorPanel(), "Data Collector")
+        self._collector_panel = CollectorPanel()
+        tabs.addTab(self._collector_panel, "Data Collector")
 
         self._build_statusbar()
 
@@ -1230,7 +1231,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        """Stop the background system monitor before the window closes."""
+        """Stop background threads before the window closes."""
+        # Cancel any in-progress Data Collector run and wait for it to exit.
+        # Qt does not propagate closeEvent to child widgets, so we do it explicitly.
+        self._collector_panel.closeEvent(event)
+        if not event.isAccepted():
+            return
         self._sys_monitor.stop()
         self._sys_monitor.wait(2000)   # give it up to 2 s to exit cleanly
         super().closeEvent(event)

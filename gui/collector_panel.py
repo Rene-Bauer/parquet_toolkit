@@ -250,6 +250,13 @@ class CollectorPanel(QWidget):
     def _on_workers_scaled(self, new_count: int, old_count: int, direction: str, reason: str) -> None:
         self._log_info(f"Workers {old_count}→{new_count} ({direction}): {reason}")
 
+    def closeEvent(self, event) -> None:
+        """Cancel any running worker and wait for it to exit before closing."""
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait(5000)  # give it up to 5 s to finish cleanly
+        super().closeEvent(event)
+
     # ------------------------------------------------------------------
     # Logging helpers
     # ------------------------------------------------------------------
