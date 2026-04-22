@@ -18,8 +18,9 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-# Resolved relative to this file so it always points to repo root/checkpoints/
-_CHECKPOINTS_DIR: Path = Path(__file__).parent.parent / "checkpoints"
+# Store checkpoints in the user's home directory so the app works without
+# elevated permissions when installed in a system-protected location (e.g. C:\).
+_CHECKPOINTS_DIR: Path = Path.home() / ".parquet_toolkit" / "checkpoints"
 
 
 def _sanitize_key(container: str, prefix: str) -> str:
