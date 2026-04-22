@@ -235,6 +235,13 @@ class CollectorPanel(QWidget):
                 f"Collection complete: {row_count} rows → [{out_container}] {out_blob}"
             )
         if self._worker is not None:
+            # Wait for run() to fully return before dropping the Python reference.
+            # finished/cancelled are emitted BEFORE the finally block completes,
+            # so the OS thread may still be alive when this slot is called.
+            # Setting self._worker = None without wait() triggers Python's
+            # reference-count GC immediately, which calls the C++ QThread
+            # destructor while the thread is still running → crash.
+            self._worker.wait(2000)
             self._worker.deleteLater()
             self._worker = None
 
@@ -244,6 +251,7 @@ class CollectorPanel(QWidget):
         self._progress.setVisible(False)
         self._log_info("Collection cancelled.")
         if self._worker is not None:
+            self._worker.wait(2000)  # same race as _on_finished — see comment above
             self._worker.deleteLater()
             self._worker = None
 
