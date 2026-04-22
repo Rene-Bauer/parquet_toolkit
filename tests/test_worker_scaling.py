@@ -33,6 +33,9 @@ class DummyScaler:
     def consume_hot_error_flag(self) -> bool:  # pragma: no cover - only for interface completeness
         return False
 
+    def consume_bandwidth_cap_update(self) -> tuple[bool, int]:
+        return False, 0
+
 
 def _make_worker() -> TransformWorker:
     return TransformWorker(
