@@ -214,9 +214,7 @@ def test_accumulator_total_rows_property():
 
 def test_accumulator_update_matches_reference_output():
     """Vectorised update() must produce the same deviceIds as the loop-based version."""
-    import pyarrow.compute as pc
-
-    table = _make_table()  # 4 rows, 3 distinct triples
+    table = _make_table()  # 4 rows, 4 distinct triples
 
     acc = MetadataAccumulator()
     acc.update(table)
@@ -232,6 +230,28 @@ def test_accumulator_update_matches_reference_output():
         )
     })
     assert meta["deviceIds"] == ",".join(expected_triples)
+
+
+def test_accumulator_update_ignores_null_triples():
+    """Rows where any of SenderUid/DeviceUid/MessageVersion is null must not
+    cause None to enter the triples set (which would crash to_metadata's sort)."""
+    ts = _ts_ms(2026, 4, 14, 23, 45, 8)
+    table = pa.table({
+        "Id": ["a", "b"],
+        "SenderUid": pa.array(["uid1", None], type=pa.string()),
+        "DeviceUid": pa.array(["dev1", "dev1"], type=pa.string()),
+        "DeviceType": ["T", "T"],
+        "DeviceManufacturer": ["M", "M"],
+        "TsCreate": pa.array([ts, ts], type=pa.timestamp("ms", tz="UTC")),
+        "MessageVersion": pa.array(["1.0", "1.0"], type=pa.string()),
+        "MessageType": ["X", "X"],
+        "Payload": ["p1", "p2"],
+    })
+    acc = MetadataAccumulator()
+    acc.update(table)
+    meta = acc.to_metadata()   # must not raise TypeError
+    assert "uid1 dev1 1.0" in meta["deviceIds"]
+    assert "None" not in meta["deviceIds"]
 
 
 # --- rewrite_with_metadata ---
