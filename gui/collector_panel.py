@@ -23,6 +23,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+MAX_LOG_ENTRIES: int = 5_000
+"""Maximum log lines kept before auto-flushing to disk."""
+
+_LOG_DIR_OVERRIDE: str | None = None
+"""Redirect log files during tests; None = project_root/logs/."""
+
 from gui.collector_schema_table import CollectorSchemaTable
 from gui.resources_panel import ResourcesPanel
 from gui.workers import DataCollectorWorker, SchemaLoaderWorker, _format_duration
@@ -37,6 +43,8 @@ class CollectorPanel(QWidget):
         self._worker: DataCollectorWorker | None = None
         self._is_paused: bool = False
         self._run_start_time: float = 0.0
+        self._log_entries: list[tuple[str, QColor | None]] = []
+        self._log_flush_count: int = 0
         self._worker_cleanup_timer: QTimer | None = None
         self._schema_worker: SchemaLoaderWorker | None = None
 
@@ -199,6 +207,16 @@ class CollectorPanel(QWidget):
     def _build_log_group(self) -> QGroupBox:
         box = QGroupBox("Log")
         layout = QVBoxLayout(box)
+
+        toolbar = QHBoxLayout()
+        btn_export = QPushButton("Export Log…")
+        btn_export.setFixedWidth(95)
+        btn_export.setToolTip("Save all log entries to a .txt file")
+        btn_export.clicked.connect(self._on_export_log)
+        toolbar.addStretch()
+        toolbar.addWidget(btn_export)
+        layout.addLayout(toolbar)
+
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         self._log.setMinimumHeight(140)
@@ -463,6 +481,13 @@ class CollectorPanel(QWidget):
         self._append_log(text, color=QColor("#cc0000"))
 
     def _append_log(self, text: str, color: QColor | None) -> None:
+        self._log_entries.append((text, color))
+        if len(self._log_entries) >= MAX_LOG_ENTRIES:
+            self._flush_log_to_file()
+            return
+        self._write_to_widget(text, color)
+
+    def _write_to_widget(self, text: str, color: QColor | None) -> None:
         cursor = self._log.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         fmt = QTextCharFormat()
@@ -472,3 +497,50 @@ class CollectorPanel(QWidget):
         cursor.insertText(text + "\n")
         self._log.setTextCursor(cursor)
         self._log.ensureCursorVisible()
+
+    def _flush_log_to_file(self) -> None:
+        """Write all in-memory log entries to a timestamped file, then clear."""
+        self._log_flush_count += 1
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"collector_log_{timestamp}_{self._log_flush_count}.txt"
+        if _LOG_DIR_OVERRIDE:
+            log_dir = _LOG_DIR_OVERRIDE
+        else:
+            log_dir = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)), "logs"
+            )
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, filename)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                for entry_text, _ in self._log_entries:
+                    f.write(entry_text + "\n")
+        except Exception:
+            pass  # best-effort: don't block the GUI for a flush failure
+        self._log_entries.clear()
+        self._log.clear()
+        warn_color = QColor("#aa8800")
+        self._write_to_widget(
+            f"[Log flushed to {path} ({MAX_LOG_ENTRIES} entries) — continuing]",
+            warn_color,
+        )
+
+    def _on_export_log(self) -> None:
+        """Export all in-memory log entries to a user-chosen .txt file."""
+        from PyQt6.QtWidgets import QFileDialog
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Log",
+            f"collector_log_{timestamp}.txt",
+            "Text Files (*.txt);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                for text, _ in self._log_entries:
+                    f.write(text + "\n")
+            self._log_info(f"Log exported to: {path}")
+        except Exception as exc:
+            self._log_error(f"Failed to export log: {exc}")

@@ -134,3 +134,35 @@ def test_eta_label_clears_on_cancelled():
     panel._eta_label.setText("ETA 1m 30s (~14:00)")
     panel._on_cancelled()
     assert panel._eta_label.text() == ""
+
+
+def test_log_entries_accumulate():
+    panel = CollectorPanel()
+    panel._log_info("hello")
+    panel._log_error("oops")
+    assert len(panel._log_entries) == 2
+    assert panel._log_entries[0] == ("hello", None)
+    text, color = panel._log_entries[1]
+    assert text == "oops"
+    assert color is not None   # errors have a colour
+
+
+def test_flush_log_writes_file_and_clears_entries(tmp_path, monkeypatch):
+    import gui.collector_panel as cp_mod
+    monkeypatch.setattr(cp_mod, "_LOG_DIR_OVERRIDE", str(tmp_path))
+    panel = CollectorPanel()
+    panel._log_entries = [("line1", None), ("line2", None)]
+    panel._flush_log_to_file()
+    # Entries cleared after flush
+    assert len(panel._log_entries) == 0
+    # A .txt file was written
+    files = list(tmp_path.iterdir())
+    assert len(files) == 1
+    content = files[0].read_text(encoding="utf-8")
+    assert "line1" in content
+    assert "line2" in content
+
+
+def test_flush_count_increments():
+    panel = CollectorPanel()
+    assert panel._log_flush_count == 0
