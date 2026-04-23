@@ -338,9 +338,6 @@ class CollectorPanel(QWidget):
                 return
             run_record.reset()
 
-        run_record.mark_in_progress()
-        self._run_record = run_record
-
         output_prefix = self._output_edit.text().strip()
         if not output_prefix:
             self._log_error("Output prefix is required.")
@@ -351,6 +348,9 @@ class CollectorPanel(QWidget):
             return
 
         selected_columns = self._schema_table.get_selected_columns()
+
+        run_record.mark_in_progress()
+        self._run_record = run_record
 
         self._collect_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
@@ -456,11 +456,17 @@ class CollectorPanel(QWidget):
         self._eta_label.setText("")
         self._progress.setVisible(False)
         row_count = result.get("rowCount", 0)
-        if self._run_record is not None and row_count > 0:
-            self._run_record.mark_complete(
-                result.get("outputBlob", ""),
-                row_count,
-            )
+        if self._run_record is not None:
+            if row_count > 0:
+                self._run_record.mark_complete(
+                    result.get("outputBlob", ""),
+                    row_count,
+                )
+            else:
+                # 0-row run finished cleanly — reset so the next run doesn't
+                # show a spurious "Previous run interrupted" dialog.
+                self._run_record.reset()
+            self._run_record = None
         if row_count == 0:
             self._log_info("Collection complete: no matching rows found.")
         else:
@@ -481,6 +487,7 @@ class CollectorPanel(QWidget):
         self._eta_label.setText("")
         self._progress.setVisible(False)
         self._log_info("Collection cancelled.")
+        self._run_record = None
         self._resources_panel.clear_worker_throughput()
         self._request_worker_cleanup()
 
@@ -563,9 +570,9 @@ class CollectorPanel(QWidget):
             log_dir = os.path.join(
                 os.path.dirname(os.path.dirname(__file__)), "logs"
             )
-        os.makedirs(log_dir, exist_ok=True)
         path = os.path.join(log_dir, filename)
         try:
+            os.makedirs(log_dir, exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 for entry_text, _ in self._log_entries:
                     f.write(entry_text + "\n")
