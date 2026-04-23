@@ -166,3 +166,87 @@ def test_flush_log_writes_file_and_clears_entries(tmp_path, monkeypatch):
 def test_flush_count_increments():
     panel = CollectorPanel()
     assert panel._log_flush_count == 0
+
+
+def test_run_record_is_none_initially():
+    panel = CollectorPanel()
+    assert hasattr(panel, '_run_record')
+    assert panel._run_record is None
+
+
+def test_on_collect_calls_mark_in_progress(monkeypatch):
+    """Collect stores a run record and calls mark_in_progress."""
+    from unittest.mock import MagicMock, patch
+
+    panel = CollectorPanel()
+    panel._conn_edit.setText("fake_conn_string")
+    panel._container_edit.setText("mycontainer")
+    panel._source_edit.setText("prefix/")
+    panel._output_edit.setText("out/")
+    panel._ids_edit.setPlainText("uid1")
+
+    mock_record = MagicMock()
+    mock_record.is_complete.return_value = False
+    mock_record.status = "none"
+
+    mock_worker = MagicMock()
+    # Make mock_worker support all the signal connections
+    mock_worker.listing_complete = MagicMock()
+    mock_worker.listing_complete.connect = MagicMock()
+    mock_worker.progress = MagicMock()
+    mock_worker.progress.connect = MagicMock()
+    mock_worker.file_error = MagicMock()
+    mock_worker.file_error.connect = MagicMock()
+    mock_worker.finished = MagicMock()
+    mock_worker.finished.connect = MagicMock()
+    mock_worker.cancelled = MagicMock()
+    mock_worker.cancelled.connect = MagicMock()
+    mock_worker.log_message = MagicMock()
+    mock_worker.log_message.connect = MagicMock()
+    mock_worker.workers_scaled = MagicMock()
+    mock_worker.workers_scaled.connect = MagicMock()
+    mock_worker.paused = MagicMock()
+    mock_worker.paused.connect = MagicMock()
+    mock_worker.resumed = MagicMock()
+    mock_worker.resumed.connect = MagicMock()
+    mock_worker.start = MagicMock()
+
+    with patch("gui.collector_panel.CollectorRunRecord") as mock_cls, \
+         patch("gui.collector_panel.DataCollectorWorker", return_value=mock_worker):
+        mock_cls.load_or_create.return_value = mock_record
+        panel._on_collect()
+
+    mock_record.mark_in_progress.assert_called_once()
+    assert panel._run_record is mock_record
+
+
+def test_on_finished_with_rows_calls_mark_complete():
+    """_on_finished marks run complete when rows were produced."""
+    from unittest.mock import MagicMock
+
+    panel = CollectorPanel()
+    mock_record = MagicMock()
+    panel._run_record = mock_record
+
+    panel._on_finished({
+        "rowCount": 10,
+        "outputBlob": "out/SenderUid_uid1.parquet",
+        "outputContainer": "mycontainer",
+    })
+
+    mock_record.mark_complete.assert_called_once_with(
+        "out/SenderUid_uid1.parquet", 10
+    )
+
+
+def test_on_finished_with_no_rows_does_not_mark_complete():
+    """_on_finished does NOT mark complete when no rows were collected."""
+    from unittest.mock import MagicMock
+
+    panel = CollectorPanel()
+    mock_record = MagicMock()
+    panel._run_record = mock_record
+
+    panel._on_finished({"rowCount": 0})
+
+    mock_record.mark_complete.assert_not_called()

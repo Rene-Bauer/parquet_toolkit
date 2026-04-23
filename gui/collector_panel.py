@@ -33,6 +33,7 @@ from gui.collector_schema_table import CollectorSchemaTable
 from gui.resources_panel import ResourcesPanel
 from gui.workers import DataCollectorWorker, SchemaLoaderWorker, _format_duration
 from parquet_transform.collector import _REQUIRED_COLS
+from parquet_transform.checkpoint import CollectorRunRecord
 
 
 class CollectorPanel(QWidget):
@@ -45,6 +46,7 @@ class CollectorPanel(QWidget):
         self._run_start_time: float = 0.0
         self._log_entries: list[tuple[str, QColor | None]] = []
         self._log_flush_count: int = 0
+        self._run_record: CollectorRunRecord | None = None
         self._worker_cleanup_timer: QTimer | None = None
         self._schema_worker: SchemaLoaderWorker | None = None
 
@@ -292,6 +294,53 @@ class CollectorPanel(QWidget):
             self._log_error("Enter at least one ID.")
             return
 
+        # Last Run Detection: check for a previous run with the same key
+        try:
+            run_record = CollectorRunRecord.load_or_create(
+                container,
+                self._source_edit.text().strip(),
+                self._filter_combo.currentText(),
+                filter_values,
+            )
+        except RuntimeError as exc:
+            self._log_error(f"Corrupt run record (delete file to reset): {exc}")
+            return
+
+        if run_record.is_complete():
+            from PyQt6.QtWidgets import QMessageBox
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Previous Run Found")
+            msg.setText(
+                f"A previous collection run completed successfully.\n\n"
+                f"Output blob:  {run_record.output_blob}\n"
+                f"Row count:    {run_record.row_count}\n\n"
+                "Re-run and overwrite the output?"
+            )
+            rerun_btn = msg.addButton("Re-run", QMessageBox.ButtonRole.AcceptRole)
+            msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
+            if msg.clickedButton() != rerun_btn:
+                return
+            run_record.reset()
+
+        elif run_record.status == "in_progress":
+            from PyQt6.QtWidgets import QMessageBox
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Previous Run Interrupted")
+            msg.setText(
+                "A previous collection run was interrupted before completing.\n\n"
+                "Start a fresh run?"
+            )
+            fresh_btn = msg.addButton("Start Fresh", QMessageBox.ButtonRole.AcceptRole)
+            msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
+            if msg.clickedButton() != fresh_btn:
+                return
+            run_record.reset()
+
+        run_record.mark_in_progress()
+        self._run_record = run_record
+
         output_prefix = self._output_edit.text().strip()
         if not output_prefix:
             self._log_error("Output prefix is required.")
@@ -407,6 +456,11 @@ class CollectorPanel(QWidget):
         self._eta_label.setText("")
         self._progress.setVisible(False)
         row_count = result.get("rowCount", 0)
+        if self._run_record is not None and row_count > 0:
+            self._run_record.mark_complete(
+                result.get("outputBlob", ""),
+                row_count,
+            )
         if row_count == 0:
             self._log_info("Collection complete: no matching rows found.")
         else:
