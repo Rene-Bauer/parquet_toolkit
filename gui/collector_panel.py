@@ -1,6 +1,10 @@
 """Self-contained Data-Collector panel widget."""
 from __future__ import annotations
 
+import os
+from datetime import datetime, timedelta
+from time import perf_counter
+
 from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
@@ -21,7 +25,7 @@ from PyQt6.QtWidgets import (
 
 from gui.collector_schema_table import CollectorSchemaTable
 from gui.resources_panel import ResourcesPanel
-from gui.workers import DataCollectorWorker, SchemaLoaderWorker
+from gui.workers import DataCollectorWorker, SchemaLoaderWorker, _format_duration
 from parquet_transform.collector import _REQUIRED_COLS
 
 
@@ -32,6 +36,7 @@ class CollectorPanel(QWidget):
         super().__init__(parent)
         self._worker: DataCollectorWorker | None = None
         self._is_paused: bool = False
+        self._run_start_time: float = 0.0
         self._worker_cleanup_timer: QTimer | None = None
         self._schema_worker: SchemaLoaderWorker | None = None
 
@@ -174,12 +179,15 @@ class CollectorPanel(QWidget):
         self._pause_btn = QPushButton("Pause")
         self._pause_btn.setFixedWidth(80)
         self._pause_btn.setEnabled(False)
+        self._eta_label = QLabel("")
+        self._eta_label.setStyleSheet("color: gray;")
         self._progress = QProgressBar()
         self._progress.setVisible(False)
 
         layout.addWidget(self._collect_btn)
         layout.addWidget(self._cancel_btn)
         layout.addWidget(self._pause_btn)
+        layout.addWidget(self._eta_label)
         layout.addWidget(self._progress, stretch=1)
 
         self._collect_btn.clicked.connect(self._on_collect)
@@ -282,6 +290,8 @@ class CollectorPanel(QWidget):
         self._pause_btn.setEnabled(True)
         self._pause_btn.setText("Pause")
         self._is_paused = False
+        self._run_start_time = perf_counter()
+        self._eta_label.setText("")
         self._progress.setValue(0)
         self._progress.setVisible(True)
         col_note = (
@@ -345,8 +355,27 @@ class CollectorPanel(QWidget):
     def _on_progress(self, completed: int, total: int, blob_name: str, matched_rows: int) -> None:
         self._progress.setValue(completed)
         if matched_rows > 0:
-            short = blob_name.rsplit("/", 1)[-1]  # just the filename, not the full path
+            short = blob_name.rsplit("/", 1)[-1]
             self._log_info(f"  [{completed}/{total}] {short}: {matched_rows} row(s) matched")
+
+        # ETA
+        elapsed = perf_counter() - self._run_start_time
+        if completed > 0 and elapsed > 1.0 and total > 0:
+            s_per_blob = elapsed / completed
+            remaining = total - completed
+            elapsed_str = _format_duration(elapsed)
+            if remaining > 0:
+                eta_s = s_per_blob * remaining
+                finish_time = datetime.now() + timedelta(seconds=int(eta_s))
+                if finish_time.date() == datetime.now().date():
+                    finish_str = finish_time.strftime("%H:%M")
+                else:
+                    finish_str = finish_time.strftime("%d.%m. %H:%M")
+                self._eta_label.setText(
+                    f"Elapsed: {elapsed_str}  ·  ETA {_format_duration(eta_s)} (~{finish_str})"
+                )
+            else:
+                self._eta_label.setText(f"Elapsed: {elapsed_str}")
 
     def _on_file_error(self, blob_name: str, error: str) -> None:
         self._log_error(f"[{blob_name}]: {error}")
@@ -357,6 +386,7 @@ class CollectorPanel(QWidget):
         self._pause_btn.setEnabled(False)
         self._pause_btn.setText("Pause")
         self._is_paused = False
+        self._eta_label.setText("")
         self._progress.setVisible(False)
         row_count = result.get("rowCount", 0)
         if row_count == 0:
@@ -376,6 +406,7 @@ class CollectorPanel(QWidget):
         self._pause_btn.setEnabled(False)
         self._pause_btn.setText("Pause")
         self._is_paused = False
+        self._eta_label.setText("")
         self._progress.setVisible(False)
         self._log_info("Collection cancelled.")
         self._resources_panel.clear_worker_throughput()

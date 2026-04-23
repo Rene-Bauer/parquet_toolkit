@@ -114,3 +114,23 @@ def test_on_cancelled_disables_pause_btn():
     panel._pause_btn.setEnabled(True)
     panel._on_cancelled()
     assert not panel._pause_btn.isEnabled()
+
+
+def test_eta_label_exists_and_initially_empty():
+    panel = CollectorPanel()
+    assert hasattr(panel, '_eta_label')
+    assert panel._eta_label.text() == ""
+
+
+def test_eta_label_clears_on_finished():
+    panel = CollectorPanel()
+    panel._eta_label.setText("ETA 1m 30s (~14:00)")
+    panel._on_finished({"rowCount": 0})
+    assert panel._eta_label.text() == ""
+
+
+def test_eta_label_clears_on_cancelled():
+    panel = CollectorPanel()
+    panel._eta_label.setText("ETA 1m 30s (~14:00)")
+    panel._on_cancelled()
+    assert panel._eta_label.text() == ""

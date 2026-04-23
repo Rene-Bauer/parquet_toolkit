@@ -151,6 +151,20 @@ def _format_bytes(n: int) -> str:
     return f"{value:.1f} PB"
 
 
+def _format_duration(seconds: float) -> str:
+    """Format seconds as 'Xh Ym Zs' / 'Xm Ys' / 'X.XXs'."""
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    if seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes}m {secs}s"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hours}h {minutes}m {secs}s"
+
+
 @dataclass
 class _FileResult:
     status: str
