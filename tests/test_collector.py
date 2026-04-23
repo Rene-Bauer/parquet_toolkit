@@ -147,6 +147,23 @@ def test_make_output_blob_name_empty_ids_raises():
         make_output_blob_name("out/", "SenderUid", [])
 
 
+def test_make_output_blob_name_with_part_number():
+    name = make_output_blob_name("out/collected", "SenderUid", ["uid1"], part=1)
+    assert name == "out/collected/SenderUid_uid1_part_001.parquet"
+
+
+def test_make_output_blob_name_with_part_number_zero_padded():
+    name = make_output_blob_name("out/", "SenderUid", ["uid1"], part=42)
+    assert name == "out/SenderUid_uid1_part_042.parquet"
+
+
+def test_make_output_blob_name_part_none_unchanged():
+    """Passing part=None must produce the same result as before (backward compat)."""
+    without = make_output_blob_name("out/collected", "SenderUid", ["uid1"])
+    with_none = make_output_blob_name("out/collected", "SenderUid", ["uid1"], part=None)
+    assert without == with_none == "out/collected/SenderUid_uid1.parquet"
+
+
 # --- MetadataAccumulator ---
 
 def test_accumulator_single_chunk():

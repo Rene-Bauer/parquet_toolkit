@@ -47,13 +47,25 @@ def build_metadata(table: pa.Table) -> dict[str, str]:
     }
 
 
-def make_output_blob_name(output_prefix: str, filter_col: str, filter_values: list[str]) -> str:
-    """Generate output blob path: {output_prefix}/{filter_col}_{id1_id2...}.parquet"""
+def make_output_blob_name(
+    output_prefix: str,
+    filter_col: str,
+    filter_values: list[str],
+    part: int | None = None,
+) -> str:
+    """Generate output blob path.
+
+    Without part:  {output_prefix}/{filter_col}_{id1_id2...}.parquet
+    With part:     {output_prefix}/{filter_col}_{id1_id2...}_part_NNN.parquet
+    """
     if not filter_values:
         raise ValueError("filter_values must not be empty")
     prefix = output_prefix.rstrip("/")
     ids_part = "_".join(v.replace(" ", "_") for v in filter_values)
-    return f"{prefix}/{filter_col}_{ids_part}.parquet"
+    base = f"{prefix}/{filter_col}_{ids_part}"
+    if part is not None:
+        return f"{base}_part_{part:03d}.parquet"
+    return f"{base}.parquet"
 
 
 class MetadataAccumulator:
