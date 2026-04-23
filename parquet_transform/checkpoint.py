@@ -250,3 +250,129 @@ class FailedList:
             self._data["entries"] = []
             self._data["updated_at"] = _now()
             _atomic_write(self._path, self._data)
+
+
+# ---------------------------------------------------------------------------
+# CollectorRunRecord
+# ---------------------------------------------------------------------------
+
+class CollectorRunRecord:
+    """
+    Persists metadata about the last DataCollector run for a given
+    (container, source_prefix, filter_col, filter_values) combination.
+
+    Status values:
+    - "none"        — no run has been started yet (or was reset)
+    - "in_progress" — a run started but did not complete (cancelled / crashed)
+    - "complete"    — a run finished and produced output_blob with row_count rows
+
+    File is stored under _CHECKPOINTS_DIR using a hash of the key so that
+    different filters or prefixes never collide.
+    """
+
+    def __init__(self, path: Path, data: dict) -> None:
+        self._path = path
+        self._data = data
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def record_path(
+        container: str,
+        prefix: str,
+        filter_col: str,
+        filter_values: list[str],
+    ) -> Path:
+        """Return the .json path for this (container, prefix, filter_col, filter_values) key."""
+        sorted_values = sorted(filter_values)
+        raw = f"{container}/{prefix}/{filter_col}/{','.join(sorted_values)}"
+        digest = hashlib.sha1(raw.encode()).hexdigest()[:8]
+        c = re.sub(r"[^a-zA-Z0-9]", "_", container)
+        p = re.sub(r"[^a-zA-Z0-9]", "_", prefix)
+        return _CHECKPOINTS_DIR / f"{c}__{p}__{digest}__collector_run.json"
+
+    @staticmethod
+    def load_or_create(
+        container: str,
+        prefix: str,
+        filter_col: str,
+        filter_values: list[str],
+    ) -> "CollectorRunRecord":
+        """Load an existing record or create a fresh one with status 'none'.
+
+        Raises RuntimeError if the file exists but cannot be parsed.
+        """
+        path = CollectorRunRecord.record_path(container, prefix, filter_col, filter_values)
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"Collector run record is corrupt and cannot be loaded: {path}\n"
+                        f"Delete the file to start fresh. Detail: {exc}"
+                    ) from exc
+        else:
+            now = _now()
+            data = {
+                "container": container,
+                "prefix": prefix,
+                "filter_col": filter_col,
+                "filter_values": sorted(filter_values),
+                "status": "none",
+                "output_blob": None,
+                "row_count": 0,
+                "created_at": now,
+                "updated_at": now,
+            }
+        return CollectorRunRecord(path, data)
+
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+
+    def is_complete(self) -> bool:
+        """True when the last run finished successfully."""
+        return self._data.get("status") == "complete"
+
+    @property
+    def status(self) -> str:
+        return self._data.get("status", "none")
+
+    @property
+    def output_blob(self) -> str | None:
+        return self._data.get("output_blob")
+
+    @property
+    def row_count(self) -> int:
+        return self._data.get("row_count", 0)
+
+    # ------------------------------------------------------------------
+    # Mutations (all atomic)
+    # ------------------------------------------------------------------
+
+    def mark_in_progress(self) -> None:
+        """Record that a run has started — clears any previous result."""
+        with self._lock:
+            self._data["status"] = "in_progress"
+            self._data["output_blob"] = None
+            self._data["row_count"] = 0
+            self._data["updated_at"] = _now()
+            _atomic_write(self._path, self._data)
+
+    def mark_complete(self, output_blob: str, row_count: int) -> None:
+        """Record a successful run result."""
+        with self._lock:
+            self._data["status"] = "complete"
+            self._data["output_blob"] = output_blob
+            self._data["row_count"] = row_count
+            self._data["updated_at"] = _now()
+            _atomic_write(self._path, self._data)
+
+    def reset(self) -> None:
+        """Clear all run data — use before a fresh run when previous was complete."""
+        with self._lock:
+            self._data["status"] = "none"
+            self._data["output_blob"] = None
+            self._data["row_count"] = 0
+            self._data["updated_at"] = _now()
+            _atomic_write(self._path, self._data)
