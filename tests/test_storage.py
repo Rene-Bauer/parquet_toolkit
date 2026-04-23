@@ -39,9 +39,8 @@ class _BlobWithNegativeSize:
 
 def test_upload_stream_opens_file_and_calls_upload_blob(tmp_path):
     """upload_stream reads from the file path and passes a file handle, not bytes."""
-    from unittest.mock import MagicMock, patch, call
+    from unittest.mock import MagicMock
 
-    # Write a small file to upload
     src = tmp_path / "test.parquet"
     src.write_bytes(b"FAKE_PARQUET_DATA")
 
@@ -59,9 +58,11 @@ def test_upload_stream_opens_file_and_calls_upload_blob(tmp_path):
     mock_blob_client.upload_blob.assert_called_once()
     # First positional arg must be a file-like object (not bytes)
     first_arg = mock_blob_client.upload_blob.call_args[0][0]
-    import io
     assert hasattr(first_arg, "read"), "upload_blob must receive a file handle, not bytes"
-    assert mock_blob_client.upload_blob.call_args[1].get("overwrite") is True
+    kwargs = mock_blob_client.upload_blob.call_args[1]
+    assert kwargs.get("overwrite") is True
+    assert kwargs.get("timeout") == 600
+    assert kwargs.get("max_concurrency") == 4
 
 
 class TestExtractBlobSize:

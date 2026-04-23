@@ -2,8 +2,9 @@
 Azure Blob Storage client wrapper.
 
 Provides list, download, and upload operations against a single container.
-All Parquet I/O uses in-memory BytesIO buffers — Parquet requires random
-access and cannot be streamed sequentially.
+Downloads use in-memory BytesIO buffers (Parquet requires random access).
+Uploads support both in-memory bytes (upload_bytes) and streaming from
+disk (upload_stream — no full-file RAM load).
 """
 from __future__ import annotations
 
