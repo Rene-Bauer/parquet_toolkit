@@ -216,10 +216,10 @@ class CollectorPanel(QWidget):
 
     def _on_schema_loaded(
         self,
-        schema,
+        schema: object,
         file_count: int,
         total_bytes: int,
-        unknown_size_names: list,
+        unknown_size_names: list[str],
     ) -> None:
         self._schema_table.load_schema(schema)
         self._schema_group.setVisible(True)
@@ -257,6 +257,10 @@ class CollectorPanel(QWidget):
         output_prefix = self._output_edit.text().strip()
         if not output_prefix:
             self._log_error("Output prefix is required.")
+            return
+
+        if self._schema_worker is not None and self._schema_worker.isRunning():
+            self._log_error("Schema load is in progress — please wait.")
             return
 
         selected_columns = self._schema_table.get_selected_columns()
@@ -338,6 +342,10 @@ class CollectorPanel(QWidget):
 
     def closeEvent(self, event) -> None:
         """Cancel any running worker and wait for it to exit before closing."""
+        # Wait for schema loader (no cancel method — it's a short network call)
+        if self._schema_worker is not None and self._schema_worker.isRunning():
+            self._schema_worker.wait(5000)
+
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             if not self._worker.wait(5000):
