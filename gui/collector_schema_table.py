@@ -25,7 +25,10 @@ class CollectorSchemaTable(QWidget):
     Returns an empty list when no columns are checked.
     """
 
-    def __init__(self, parent=None) -> None:
+    _COL_NAME = 0
+    _COL_TYPE = 1
+
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._setup_ui()
 
@@ -51,15 +54,15 @@ class CollectorSchemaTable(QWidget):
         self._table = QTableWidget(0, 2)
         self._table.setHorizontalHeaderLabels(["Column", "Type"])
         self._table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.ResizeToContents
+            self._COL_NAME, QHeaderView.ResizeMode.ResizeToContents
         )
         self._table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch
+            self._COL_TYPE, QHeaderView.ResizeMode.Stretch
         )
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        self._table.setMaximumHeight(200)
+        self._table.setMaximumHeight(200)  # cap so the panel doesn't dominate the layout
         layout.addWidget(self._table)
 
         self._select_all_btn.clicked.connect(self._on_select_all)
@@ -75,11 +78,11 @@ class CollectorSchemaTable(QWidget):
             check = QCheckBox(field.name)
             check.setChecked(True)
             check.stateChanged.connect(self._update_count_label)
-            self._table.setCellWidget(row, 0, check)
+            self._table.setCellWidget(row, self._COL_NAME, check)
 
             type_item = QTableWidgetItem(str(field.type))
             type_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            self._table.setItem(row, 1, type_item)
+            self._table.setItem(row, self._COL_TYPE, type_item)
 
         self._update_count_label()
 
@@ -99,9 +102,10 @@ class CollectorSchemaTable(QWidget):
         if total == 0:
             return None
         selected = [
-            self._table.cellWidget(row, 0).text()
+            widget.text()
             for row in range(total)
-            if self._table.cellWidget(row, 0).isChecked()
+            if (widget := self._table.cellWidget(row, self._COL_NAME)) is not None
+            and widget.isChecked()
         ]
         if len(selected) == total:
             return None  # all checked — no projection needed
@@ -109,19 +113,19 @@ class CollectorSchemaTable(QWidget):
 
     def _on_select_all(self) -> None:
         for row in range(self._table.rowCount()):
-            self._table.cellWidget(row, 0).setChecked(True)
+            self._table.cellWidget(row, self._COL_NAME).setChecked(True)
 
     def _on_deselect_all(self) -> None:
         for row in range(self._table.rowCount()):
-            self._table.cellWidget(row, 0).setChecked(False)
+            self._table.cellWidget(row, self._COL_NAME).setChecked(False)
 
-    def _update_count_label(self) -> None:
+    def _update_count_label(self, _state: int = 0) -> None:
         total = self._table.rowCount()
         if total == 0:
             self._count_label.setText("No schema loaded")
             return
         selected_count = sum(
             1 for row in range(total)
-            if self._table.cellWidget(row, 0).isChecked()
+            if self._table.cellWidget(row, self._COL_NAME).isChecked()
         )
         self._count_label.setText(f"{selected_count} of {total} columns selected")
