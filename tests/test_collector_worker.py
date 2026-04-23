@@ -280,13 +280,79 @@ def test_cancel_unblocks_paused_worker():
 
 
 def test_pause_resume_signals_emitted():
-    """pause() emits paused_signal; resume() emits resumed_signal."""
+    """pause() emits paused; resume() emits resumed."""
     w = _make_worker()
     paused = []
     resumed = []
-    w.paused_signal.connect(lambda: paused.append(True))
-    w.resumed_signal.connect(lambda: resumed.append(True))
+    w.paused.connect(lambda: paused.append(True))
+    w.resumed.connect(lambda: resumed.append(True))
     w.pause()
     w.resume()
     assert paused == [True]
     assert resumed == [True]
+
+
+def test_paused_worker_stops_emitting_progress():
+    """Producers should block on _pause_event.wait() and stop reporting progress."""
+    import threading
+    import time
+    from unittest.mock import patch, MagicMock
+
+    BLOB_SLEEP = 0.1   # slow enough that blobs are clearly in-flight or blocked
+
+    # Track download start times to verify blocking: if the worker is truly
+    # paused, no new downloads should begin during the pause window.
+    download_times = []
+    download_lock = threading.Lock()
+
+    def _slow_download(blob_name, timeout=None):
+        with download_lock:
+            download_times.append(time.monotonic())
+        time.sleep(BLOB_SLEEP)
+        return _make_parquet_bytes("uid1", "dev1", 1)
+
+    mock_client = MagicMock()
+    mock_client.list_blobs.return_value = [f"p/f{i}.parquet" for i in range(8)]
+    mock_client.download_bytes.side_effect = _slow_download
+
+    with patch("gui.workers.BlobStorageClient", return_value=mock_client):
+        worker = _make_worker(max_workers=2)
+
+        t = threading.Thread(target=worker.run, daemon=True)
+        t.start()
+
+        # Let at least one blob start downloading
+        time.sleep(BLOB_SLEEP * 1.5)
+        pause_time = time.monotonic()
+        worker.pause()
+
+        # Allow any blobs whose download had already started before pause() to
+        # finish (they are past the _pause_event.wait() gate).  Then take a
+        # snapshot: no *new* download should have begun after pause_time.
+        time.sleep(BLOB_SLEEP * 2.5)
+        with download_lock:
+            snapshot = list(download_times)
+
+        # Hold the pause for another full download window to confirm nothing
+        # new starts.
+        time.sleep(BLOB_SLEEP * 2.0)
+        with download_lock:
+            final_during_pause = list(download_times)
+
+        worker.resume()
+        t.join(timeout=5.0)
+
+    with download_lock:
+        all_times = list(download_times)
+
+    # Must have started at least one download before pausing
+    downloads_before_pause = [ts for ts in all_times if ts < pause_time]
+    assert len(downloads_before_pause) > 0, "no downloads started before pause"
+
+    # No new download should start after the drain window ends (snapshot == final_during_pause)
+    assert snapshot == final_during_pause, (
+        f"new downloads started during pause: {len(final_during_pause) - len(snapshot)}"
+    )
+
+    # After resume the worker must finish all 8 blobs
+    assert len(all_times) == 8, f"only {len(all_times)} of 8 blobs downloaded"

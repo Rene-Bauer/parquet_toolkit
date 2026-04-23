@@ -929,8 +929,8 @@ class DataCollectorWorker(QThread):
     cancelled = pyqtSignal()
     log_message = pyqtSignal(str)
     workers_scaled = pyqtSignal(int, int, str, str)
-    paused_signal = pyqtSignal()
-    resumed_signal = pyqtSignal()
+    paused = pyqtSignal()
+    resumed = pyqtSignal()
 
     def __init__(
         self,
@@ -971,12 +971,14 @@ class DataCollectorWorker(QThread):
         self._pause_event.set()  # unblock any paused producers so they can exit
 
     def pause(self) -> None:
-        self._pause_event.clear()
-        self.paused_signal.emit()
+        if self._pause_event.is_set():   # only act if currently running
+            self._pause_event.clear()
+            self.paused.emit()
 
     def resume(self) -> None:
-        self._pause_event.set()
-        self.resumed_signal.emit()
+        if not self._pause_event.is_set():   # only act if currently paused
+            self._pause_event.set()
+            self.resumed.emit()
 
     def run(self) -> None:
         import os
@@ -1112,6 +1114,9 @@ class DataCollectorWorker(QThread):
                             return
                         self._pause_event.wait()   # block here when paused
                         if self._cancel_event.is_set():
+                            # Blob was dequeued but not processed — completed[0] is not
+                            # incremented here. The coordination loop handles this correctly
+                            # by draining the queue and breaking on cancel.
                             return
                         matched_rows: int = 0
                         try:
