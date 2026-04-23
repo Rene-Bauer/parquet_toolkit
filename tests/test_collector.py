@@ -212,6 +212,28 @@ def test_accumulator_total_rows_property():
     assert acc.total_rows == 4
 
 
+def test_accumulator_update_matches_reference_output():
+    """Vectorised update() must produce the same deviceIds as the loop-based version."""
+    import pyarrow.compute as pc
+
+    table = _make_table()  # 4 rows, 3 distinct triples
+
+    acc = MetadataAccumulator()
+    acc.update(table)
+    meta = acc.to_metadata()
+
+    # Reference: compute expected triples the old slow way
+    expected_triples = sorted({
+        f"{s} {d} {v}"
+        for s, d, v in zip(
+            table.column("SenderUid").to_pylist(),
+            table.column("DeviceUid").to_pylist(),
+            table.column("MessageVersion").to_pylist(),
+        )
+    })
+    assert meta["deviceIds"] == ",".join(expected_triples)
+
+
 # --- rewrite_with_metadata ---
 
 def test_rewrite_with_metadata_produces_valid_parquet(tmp_path):

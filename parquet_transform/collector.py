@@ -94,12 +94,15 @@ class MetadataAccumulator:
             self._min_ts = chunk_min
         if self._max_ts is None or chunk_max > self._max_ts:
             self._max_ts = chunk_max
-        for s, d, v in zip(
-            chunk.column("SenderUid").to_pylist(),
-            chunk.column("DeviceUid").to_pylist(),
-            chunk.column("MessageVersion").to_pylist(),
-        ):
-            self._triples.add(f"{s} {d} {v}")
+        # Build "SenderUid DeviceUid MessageVersion" strings at C++ speed,
+        # deduplicate, then merge into the running set.
+        combined = pc.binary_join_element_wise(
+            chunk.column("SenderUid"),
+            chunk.column("DeviceUid"),
+            chunk.column("MessageVersion"),
+            " ",
+        )
+        self._triples.update(pc.unique(combined).to_pylist())
 
     def to_metadata(self) -> dict[str, str]:
         if self._total_rows == 0:
