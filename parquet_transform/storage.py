@@ -145,6 +145,29 @@ class BlobStorageClient:
         blob_client = self._container.get_blob_client(blob_name)
         blob_client.upload_blob(data, overwrite=overwrite, timeout=timeout)
 
+    def upload_stream(
+        self,
+        blob_name: str,
+        file_path: str,
+        overwrite: bool = True,
+        timeout: int = 600,
+        max_concurrency: int = 4,
+    ) -> None:
+        """Upload a local file to a blob by streaming directly from disk.
+
+        Unlike upload_bytes, this never loads the full file into RAM.
+        max_concurrency controls the number of parallel Azure block uploads
+        for large files (Azure SDK default is 1).
+        """
+        blob_client = self._container.get_blob_client(blob_name)
+        with open(file_path, "rb") as fh:
+            blob_client.upload_blob(
+                fh,
+                overwrite=overwrite,
+                timeout=timeout,
+                max_concurrency=max_concurrency,
+            )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------

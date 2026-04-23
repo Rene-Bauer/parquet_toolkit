@@ -37,6 +37,33 @@ class _BlobWithNegativeSize:
     size = -5
 
 
+def test_upload_stream_opens_file_and_calls_upload_blob(tmp_path):
+    """upload_stream reads from the file path and passes a file handle, not bytes."""
+    from unittest.mock import MagicMock, patch, call
+
+    # Write a small file to upload
+    src = tmp_path / "test.parquet"
+    src.write_bytes(b"FAKE_PARQUET_DATA")
+
+    mock_blob_client = MagicMock()
+    mock_container = MagicMock()
+    mock_container.get_blob_client.return_value = mock_blob_client
+
+    from parquet_transform.storage import BlobStorageClient
+    client = BlobStorageClient.__new__(BlobStorageClient)
+    client._container = mock_container
+
+    client.upload_stream("output/test.parquet", str(src))
+
+    mock_container.get_blob_client.assert_called_once_with("output/test.parquet")
+    mock_blob_client.upload_blob.assert_called_once()
+    # First positional arg must be a file-like object (not bytes)
+    first_arg = mock_blob_client.upload_blob.call_args[0][0]
+    import io
+    assert hasattr(first_arg, "read"), "upload_blob must receive a file handle, not bytes"
+    assert mock_blob_client.upload_blob.call_args[1].get("overwrite") is True
+
+
 class TestExtractBlobSize:
     def test_reads_size_attribute(self):
         assert _extract_blob_size(_BlobWithSize(1024)) == 1024
