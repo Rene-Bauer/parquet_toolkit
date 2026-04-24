@@ -998,7 +998,6 @@ class DataCollectorWorker(QThread):
         import os
         import tempfile
         from parquet_transform.collector import (
-            filter_table_by_ids,
             make_output_blob_name,
             MetadataAccumulator,
             rewrite_with_metadata,
@@ -1137,13 +1136,15 @@ class DataCollectorWorker(QThread):
                             t0 = time.monotonic()
                             raw = client.download_bytes(blob_name, timeout=DOWNLOAD_TIMEOUT_S)
                             dl_s = time.monotonic() - t0
-                            table = pq.read_table(io.BytesIO(raw))
-                            filtered = filter_table_by_ids(
-                                table, self._filter_col, self._filter_values
+                            # Predicate pushdown: PyArrow skips row groups at C++ level.
+                            # Pass columns= at the same time to avoid decoding unused columns.
+                            table = pq.read_table(
+                                io.BytesIO(raw),
+                                columns=self._selected_columns,
+                                filters=[(self._filter_col, "in", self._filter_values)],
                             )
-                            matched_rows = filtered.num_rows  # capture before column projection
-                            if self._selected_columns is not None:
-                                filtered = filtered.select(self._selected_columns)
+                            matched_rows = table.num_rows
+                            filtered = table
                             if scaler is not None:
                                 scaler.record_download(len(raw), dl_s, True)
                             if filtered.num_rows > 0:

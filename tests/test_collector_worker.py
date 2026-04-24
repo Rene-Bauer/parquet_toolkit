@@ -356,3 +356,31 @@ def test_paused_worker_stops_emitting_progress():
 
     # After resume the worker must finish all 8 blobs
     assert len(all_times) == 8, f"only {len(all_times)} of 8 blobs downloaded"
+
+
+def test_predicate_pushdown_calls_read_table_with_filters():
+    """_producer must use pq.read_table filters= instead of post-read Python filter."""
+    import pyarrow.parquet as pq
+    from unittest.mock import patch, MagicMock
+
+    mock_client = MagicMock()
+    mock_client.list_blobs.return_value = ["p/f1.parquet"]
+    mock_client.download_bytes.return_value = _make_parquet_bytes("uid1", "dev1", 2)
+
+    read_table_calls = []
+    _orig_read_table = pq.read_table
+
+    def _spy_read_table(source, **kwargs):
+        read_table_calls.append(kwargs)
+        return _orig_read_table(source, **kwargs)
+
+    with patch("gui.workers.BlobStorageClient", return_value=mock_client):
+        with patch("gui.workers.pq.read_table", side_effect=_spy_read_table):
+            results = _run_worker(_make_worker())
+
+    assert results["rowCount"] == 2
+    assert len(read_table_calls) >= 1
+    producer_calls = [c for c in read_table_calls if "filters" in c]
+    assert len(producer_calls) >= 1, "pq.read_table in _producer must pass filters="
+    flt = producer_calls[0]["filters"]
+    assert any("SenderUid" in str(f) for f in flt), f"Expected SenderUid filter, got {flt}"
