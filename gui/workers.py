@@ -959,6 +959,7 @@ class DataCollectorWorker(QThread):
         ram_limit_mb: int = 1024,
         autoscale: bool = True,
         selected_columns: list[str] | None = None,
+        max_output_bytes: int = 0,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -973,6 +974,7 @@ class DataCollectorWorker(QThread):
         self._ram_limit_bytes = ram_limit_mb * 1024 * 1024
         self._autoscale = autoscale
         self._selected_columns = selected_columns
+        self._max_output_bytes = max_output_bytes
         self._worker_count = max_workers
         self._cancel_event = threading.Event()
         self._pause_event = threading.Event()
@@ -1006,9 +1008,9 @@ class DataCollectorWorker(QThread):
 
         source_client = None
         output_client = None
-        tmp1_path: str | None = None
-        tmp2_path: str | None = None
+        tmp1_ref: list = [None]      # mutable so writer can swap the temp file on flush
         writer_ref: list = [None]
+        part_names: list[str] = []   # populated by writer; read by main thread after join
         writer_stop = threading.Event()
         writer_thread: threading.Thread | None = None
         # Sentinel: set to True before every terminal signal emit so the
@@ -1053,8 +1055,9 @@ class DataCollectorWorker(QThread):
 
             meta_acc = MetadataAccumulator()
 
-            tmp1_fd, tmp1_path = tempfile.mkstemp(suffix=".parquet")
+            tmp1_fd, tmp1_initial = tempfile.mkstemp(suffix=".parquet")
             os.close(tmp1_fd)
+            tmp1_ref[0] = tmp1_initial
 
             writer_error: list = [None]
             # Arrow schema used to create the ParquetWriter (set on first chunk).
@@ -1064,39 +1067,108 @@ class DataCollectorWorker(QThread):
             writer_schema: list = [None]
 
             # ── Writer thread ─────────────────────────────────────────────
+            # Per-part metadata accumulator (reset after each flush).
+            # The global meta_acc tracks totals for finished.emit.
+            part_acc_ref: list = [MetadataAccumulator()]
+            part_counter = [0]
+
+            def _flush_and_upload() -> None:
+                """Close writer, rewrite metadata, upload via stream, start fresh tmp."""
+                if writer_ref[0] is not None:
+                    writer_ref[0].close()
+                    writer_ref[0] = None
+
+                current_tmp = tmp1_ref[0]
+                if part_acc_ref[0].total_rows == 0:
+                    return  # nothing to flush
+
+                part_counter[0] += 1
+                if self._max_output_bytes > 0:
+                    out_name = make_output_blob_name(
+                        self._output_prefix,
+                        self._filter_col,
+                        self._filter_values,
+                        part=part_counter[0],
+                    )
+                else:
+                    out_name = make_output_blob_name(
+                        self._output_prefix,
+                        self._filter_col,
+                        self._filter_values,
+                    )
+
+                final_meta = part_acc_ref[0].to_metadata()
+                rw_fd, rw_tmp = tempfile.mkstemp(suffix=".parquet")
+                os.close(rw_fd)
+                try:
+                    rewrite_with_metadata(current_tmp, rw_tmp, final_meta)
+                    output_client.upload_stream(
+                        out_name, rw_tmp,
+                        timeout=UPLOAD_TIMEOUT_S,
+                    )
+                    part_names.append(out_name)
+                finally:
+                    try:
+                        os.unlink(rw_tmp)
+                    except Exception:
+                        pass
+
+                try:
+                    os.unlink(current_tmp)
+                except Exception:
+                    pass
+
+                # Prepare a fresh temp file for the next part
+                new_fd, new_tmp = tempfile.mkstemp(suffix=".parquet")
+                os.close(new_fd)
+                tmp1_ref[0] = new_tmp
+                writer_schema[0] = None          # force re-init on next write
+                part_acc_ref[0] = MetadataAccumulator()
+
             def _writer_loop() -> None:
+                exited_normally = False
                 try:
                     while True:
                         try:
                             chunk = chunk_queue.get(timeout=0.2)
                         except queue.Empty:
                             if writer_stop.is_set() and chunk_queue.empty():
+                                exited_normally = True
                                 break
                             continue
                         if chunk is None:
+                            # Cancel path — do NOT flush
                             break
                         meta_acc.update(chunk)
+                        part_acc_ref[0].update(chunk)
                         if writer_ref[0] is None:
                             writer_schema[0] = chunk.schema
                             writer_ref[0] = pq.ParquetWriter(
-                                tmp1_path, chunk.schema,
+                                tmp1_ref[0], chunk.schema,
                                 compression="zstd", compression_level=3,
                             )
-                        # If this chunk's schema differs from the writer schema
-                        # (e.g. mixed timestamp[ns] / timestamp[ms,UTC] sources),
-                        # cast with safe=False so sub-ms precision is truncated
-                        # rather than aborting the entire collection run.
                         write_chunk = chunk
                         if not chunk.schema.equals(writer_schema[0], check_metadata=False):
                             write_chunk = chunk.cast(writer_schema[0], safe=False)
                         writer_ref[0].write_table(write_chunk)
                         with ram_lock:
                             ram_used[0] = max(0, ram_used[0] - chunk.nbytes)
+
+                        # Size-based flush
+                        if (
+                            self._max_output_bytes > 0
+                            and os.path.getsize(tmp1_ref[0]) >= self._max_output_bytes
+                        ):
+                            _flush_and_upload()
+
+                    if exited_normally:
+                        _flush_and_upload()
+
                 except Exception as exc:  # noqa: BLE001
                     msg, _, _ = _summarize_exception(exc)
                     writer_error[0] = msg
                     self._cancel_reason = "writer_error"
-                    self._cancel_event.set()  # unblock producers waiting on full chunk_queue
+                    self._cancel_event.set()
 
             writer_thread = threading.Thread(target=_writer_loop, daemon=True)
             writer_thread.start()
@@ -1278,7 +1350,7 @@ class DataCollectorWorker(QThread):
 
             # Stop writer
             writer_stop.set()
-            writer_thread.join(timeout=60.0)
+            writer_thread.join(timeout=300.0)
             if writer_thread.is_alive():
                 self.log_message.emit("Data-Collector writer thread timed out — aborting")
                 _emitted[0] = True
@@ -1304,28 +1376,15 @@ class DataCollectorWorker(QThread):
                 self.finished.emit({"rowCount": 0})
                 return
 
-            # Rewrite temp file with recalculated metadata (streaming, bounded RAM)
-            final_meta = meta_acc.to_metadata()
-            tmp2_fd, tmp2_path = tempfile.mkstemp(suffix=".parquet")
-            os.close(tmp2_fd)
-            rewrite_with_metadata(tmp1_path, tmp2_path, final_meta)
-
-            # Upload
-            with open(tmp2_path, "rb") as fh:
-                data = fh.read()
-
-            out_name = make_output_blob_name(
-                self._output_prefix, self._filter_col, self._filter_values
-            )
-            output_client.upload_bytes(out_name, data, overwrite=True, timeout=UPLOAD_TIMEOUT_S)
+            # Writer handled all uploads — part_names is populated
             self.log_message.emit(
-                f"Data-Collector: uploaded {out_name} → "
+                f"Data-Collector: uploaded {len(part_names)} part(s) → "
                 f"{self._output_container} ({meta_acc.total_rows} rows)"
             )
             _emitted[0] = True
             self.finished.emit({
                 "rowCount": meta_acc.total_rows,
-                "outputBlob": out_name,
+                "outputBlobs": part_names,
                 "outputContainer": self._output_container,
             })
 
@@ -1349,12 +1408,12 @@ class DataCollectorWorker(QThread):
                 source_client.close()
             if output_client is not None and output_client is not source_client:
                 output_client.close()
-            for p in (tmp1_path, tmp2_path):
-                if p is not None:
-                    try:
-                        os.unlink(p)
-                    except Exception:
-                        pass
+            p = tmp1_ref[0]
+            if p is not None:
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
             # Ensure the UI is never left frozen if an unhandled exception
             # bypassed all normal exit paths without emitting a terminal signal.
             if not _emitted[0]:

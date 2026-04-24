@@ -87,7 +87,7 @@ def test_worker_combines_rows_from_multiple_blobs():
         results = _run_worker(_make_worker())
 
     assert results["rowCount"] == 5
-    assert mock_client.upload_bytes.call_count == 1
+    assert mock_client.upload_stream.call_count == 1
 
 
 def test_worker_output_blob_name_is_correct():
@@ -98,7 +98,7 @@ def test_worker_output_blob_name_is_correct():
     with patch("gui.workers.BlobStorageClient", return_value=mock_client):
         _run_worker(_make_worker())
 
-    blob_name = mock_client.upload_bytes.call_args[0][0]
+    blob_name = mock_client.upload_stream.call_args[0][0]
     assert blob_name == "out/SenderUid_uid1.parquet"
 
 
@@ -129,7 +129,7 @@ def test_worker_no_match_skips_upload():
         results = _run_worker(_make_worker())
 
     assert results["rowCount"] == 0
-    assert mock_client.upload_bytes.call_count == 0
+    assert mock_client.upload_stream.call_count == 0
 
 
 def test_worker_emits_cancelled_when_cancel_called():
@@ -145,7 +145,7 @@ def test_worker_emits_cancelled_when_cancel_called():
         worker.run()
 
     assert cancelled == [True]
-    assert mock_client.upload_bytes.call_count == 0
+    assert mock_client.upload_stream.call_count == 0
 
 
 def test_worker_emits_file_error_on_bad_blob_and_continues():
@@ -174,23 +174,33 @@ def test_worker_emits_file_error_on_bad_blob_and_continues():
     assert len(errors) == 1
     assert errors[0] == "p/bad.parquet"
     assert results["rowCount"] == 3
-    assert mock_client.upload_bytes.call_count == 1
+    assert mock_client.upload_stream.call_count == 1
 
 
 # --- uploaded file has correct metadata ---
 
 def test_worker_output_has_correct_metadata():
+    """Uploaded file must have Parquet footer metadata (recordCount, dateFrom, dateTo)."""
+    import pyarrow.parquet as _pq
+
     mock_client = MagicMock()
     mock_client.list_blobs.return_value = ["p/f1.parquet"]
     mock_client.download_bytes.return_value = _make_parquet_bytes("uid1", "dev1", 2)
+
+    captured_tables = []
+
+    def _capture_upload(blob_name, file_path, **kwargs):
+        # Read the file while it still exists (before worker deletes it)
+        captured_tables.append(_pq.read_table(file_path))
+
+    mock_client.upload_stream.side_effect = _capture_upload
 
     with patch("gui.workers.BlobStorageClient", return_value=mock_client):
         results = _run_worker(_make_worker())
 
     assert results["rowCount"] == 2
-    uploaded_bytes = mock_client.upload_bytes.call_args[0][1]
-    result_table = pq.read_table(io.BytesIO(uploaded_bytes))
-    meta = {k.decode(): v.decode() for k, v in result_table.schema.metadata.items()}
+    assert len(captured_tables) == 1
+    meta = {k.decode(): v.decode() for k, v in captured_tables[0].schema.metadata.items()}
     assert meta["recordCount"] == "2"
     assert "+00:00" in meta["dateFrom"]
     assert "+00:00" in meta["dateTo"]
@@ -214,8 +224,8 @@ def test_worker_uses_separate_output_container():
         worker = _make_worker(container="source-container", output_container="output-container")
         _run_worker(worker)
 
-    assert output_mock.upload_bytes.call_count == 1
-    assert source_mock.upload_bytes.call_count == 0
+    assert output_mock.upload_stream.call_count == 1
+    assert source_mock.upload_stream.call_count == 0
 
 
 def test_selected_columns_stored_on_init():
@@ -386,3 +396,70 @@ def test_predicate_pushdown_calls_read_table_with_filters():
     flt = call_kwargs["filters"]
     assert any("SenderUid" in str(f) for f in flt), f"Expected SenderUid filter, got {flt}"
     assert "columns" in call_kwargs, "pq.read_table in _producer must pass columns="
+
+
+# --- max_output_bytes ---
+
+def test_max_output_bytes_defaults_to_zero():
+    w = _make_worker()
+    assert w._max_output_bytes == 0
+
+
+def test_max_output_bytes_stored_on_init():
+    w = _make_worker(max_output_bytes=5 * 1024 ** 3)
+    assert w._max_output_bytes == 5 * 1024 ** 3
+
+
+def test_writer_splits_output_when_max_output_bytes_exceeded():
+    """With a tiny max_output_bytes, each blob produces a separate _part_NNN upload."""
+    mock_client = MagicMock()
+    mock_client.list_blobs.return_value = ["p/f1.parquet", "p/f2.parquet"]
+    mock_client.download_bytes.side_effect = _make_thread_safe_download_mock(
+        _make_parquet_bytes("uid1", "dev1", 5),
+        _make_parquet_bytes("uid1", "dev1", 5),
+    )
+
+    upload_calls = []
+
+    def _capture_upload(blob_name, file_path, **kwargs):
+        upload_calls.append(blob_name)
+
+    mock_client.upload_stream.side_effect = _capture_upload
+
+    with patch("gui.workers.BlobStorageClient", return_value=mock_client):
+        # max_output_bytes=1 forces a flush after every write
+        results = _run_worker(_make_worker(max_output_bytes=1))
+
+    assert results["rowCount"] == 10
+    # At least 2 part files uploaded
+    assert len(upload_calls) >= 2
+    # All uploads must use _part_NNN naming
+    for name in upload_calls:
+        assert "_part_" in name, f"expected _part_ in blob name, got {name!r}"
+    # Parts are numbered sequentially from 001
+    assert any("_part_001" in n for n in upload_calls)
+    assert any("_part_002" in n for n in upload_calls)
+    # result includes outputBlobs list
+    assert "outputBlobs" in results
+    assert set(results["outputBlobs"]) == set(upload_calls)
+
+
+def test_writer_no_splitting_when_max_output_bytes_zero():
+    """Default (max_output_bytes=0) produces a single upload without _part_ suffix."""
+    mock_client = MagicMock()
+    mock_client.list_blobs.return_value = ["p/f1.parquet"]
+    mock_client.download_bytes.return_value = _make_parquet_bytes("uid1", "dev1", 3)
+
+    upload_calls = []
+    def _capture(blob_name, file_path, **kwargs):
+        upload_calls.append(blob_name)
+    mock_client.upload_stream.side_effect = _capture
+
+    with patch("gui.workers.BlobStorageClient", return_value=mock_client):
+        results = _run_worker(_make_worker())
+
+    assert results["rowCount"] == 3
+    assert len(upload_calls) == 1
+    assert "_part_" not in upload_calls[0]
+    assert "outputBlobs" in results
+    assert results["outputBlobs"] == upload_calls
