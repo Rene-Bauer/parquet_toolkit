@@ -382,5 +382,7 @@ def test_predicate_pushdown_calls_read_table_with_filters():
     assert len(read_table_calls) >= 1
     producer_calls = [c for c in read_table_calls if "filters" in c]
     assert len(producer_calls) >= 1, "pq.read_table in _producer must pass filters="
-    flt = producer_calls[0]["filters"]
+    call_kwargs = producer_calls[0]
+    flt = call_kwargs["filters"]
     assert any("SenderUid" in str(f) for f in flt), f"Expected SenderUid filter, got {flt}"
+    assert "columns" in call_kwargs, "pq.read_table in _producer must pass columns="

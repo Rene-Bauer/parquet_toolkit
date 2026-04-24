@@ -1138,6 +1138,9 @@ class DataCollectorWorker(QThread):
                             dl_s = time.monotonic() - t0
                             # Predicate pushdown: PyArrow skips row groups at C++ level.
                             # Pass columns= at the same time to avoid decoding unused columns.
+                            # Note: if filter_col is absent from a file's schema, PyArrow
+                            # raises ArrowInvalid (FieldRef not found) which is caught below
+                            # and routed to error_queue like any other per-blob error.
                             table = pq.read_table(
                                 io.BytesIO(raw),
                                 columns=self._selected_columns,
