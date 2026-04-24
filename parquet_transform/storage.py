@@ -80,6 +80,28 @@ class BlobStorageClient:
             if b.name.endswith(".parquet")
         ]
 
+    def list_blob_prefixes(self, prefix: str) -> list[str]:
+        """Return direct virtual-subdirectory names under *prefix* (sorted).
+
+        Uses Azure's delimiter-based listing to enumerate virtual directories
+        without downloading any blob content.  Returns an empty list if the
+        prefix contains no subdirectories (i.e. blobs are flat).
+
+        Example: prefix="archive/", subfolders "26-02-2026" and "26-03-2026"
+        returns ["26-02-2026", "26-03-2026"].
+        """
+        norm = (prefix.rstrip("/") + "/") if prefix.strip("/") else ""
+        names: list[str] = []
+        for item in self._container.walk_blobs(name_starts_with=norm, delimiter="/"):
+            item_name: str = item.name
+            # BlobPrefix objects have names ending with "/" and represent
+            # virtual directories; BlobItem objects represent actual blobs.
+            if item_name.endswith("/") and item_name != norm:
+                subfolder = item_name[len(norm):].rstrip("/")
+                if subfolder:
+                    names.append(subfolder)
+        return sorted(names)
+
     # ------------------------------------------------------------------
     # Download
     # ------------------------------------------------------------------

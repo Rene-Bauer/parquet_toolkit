@@ -1,7 +1,7 @@
 """Tests for parquet_transform.storage — _extract_blob_size (no Azure connection needed)."""
 import pytest
 
-from parquet_transform.storage import _extract_blob_size
+from parquet_transform.storage import _extract_blob_size, BlobStorageClient
 
 
 class _BlobWithSize:
@@ -95,3 +95,62 @@ class TestExtractBlobSize:
     def test_negative_size_falls_through_to_next_candidate(self):
         """A negative .size should not be returned; fall back to next candidate."""
         assert _extract_blob_size(_BlobWithNegativeSize()) == -1
+
+
+def test_list_blob_prefixes_returns_sorted_subfolder_names():
+    from unittest.mock import MagicMock, patch
+
+    mock_prefix_a = MagicMock()
+    mock_prefix_a.name = "archive/26-02-2026/"
+    mock_prefix_b = MagicMock()
+    mock_prefix_b.name = "archive/26-03-2026/"
+    mock_blob = MagicMock()
+    mock_blob.name = "archive/loose_file.parquet"  # a blob, not a prefix — must be ignored
+
+    mock_container = MagicMock()
+    mock_container.walk_blobs.return_value = [mock_prefix_b, mock_blob, mock_prefix_a]
+
+    with patch("parquet_transform.storage.BlobServiceClient") as mock_svc:
+        mock_svc.from_connection_string.return_value.get_container_client.return_value = mock_container
+        client = BlobStorageClient("fake_conn", "mycontainer")
+        result = client.list_blob_prefixes("archive/")
+
+    assert result == ["26-02-2026", "26-03-2026"]
+    mock_container.walk_blobs.assert_called_once_with(
+        name_starts_with="archive/", delimiter="/"
+    )
+
+
+def test_list_blob_prefixes_empty_when_no_subfolders():
+    from unittest.mock import MagicMock, patch
+
+    mock_blob = MagicMock()
+    mock_blob.name = "archive/somefile.parquet"
+
+    mock_container = MagicMock()
+    mock_container.walk_blobs.return_value = [mock_blob]
+
+    with patch("parquet_transform.storage.BlobServiceClient") as mock_svc:
+        mock_svc.from_connection_string.return_value.get_container_client.return_value = mock_container
+        client = BlobStorageClient("fake_conn", "mycontainer")
+        result = client.list_blob_prefixes("archive/")
+
+    assert result == []
+
+
+def test_list_blob_prefixes_strips_trailing_slash_from_input():
+    """Passing prefix without trailing slash must behave identically."""
+    from unittest.mock import MagicMock, patch
+
+    mock_prefix = MagicMock()
+    mock_prefix.name = "archive/26-02-2026/"
+
+    mock_container = MagicMock()
+    mock_container.walk_blobs.return_value = [mock_prefix]
+
+    with patch("parquet_transform.storage.BlobServiceClient") as mock_svc:
+        mock_svc.from_connection_string.return_value.get_container_client.return_value = mock_container
+        client = BlobStorageClient("fake_conn", "mycontainer")
+        result = client.list_blob_prefixes("archive")  # no trailing slash
+
+    assert result == ["26-02-2026"]
