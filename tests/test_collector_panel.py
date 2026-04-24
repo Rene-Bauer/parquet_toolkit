@@ -230,7 +230,7 @@ def test_on_finished_with_rows_calls_mark_complete():
 
     panel._on_finished({
         "rowCount": 10,
-        "outputBlob": "out/SenderUid_uid1.parquet",
+        "outputBlobs": ["out/SenderUid_uid1.parquet"],
         "outputContainer": "mycontainer",
     })
 
@@ -250,3 +250,22 @@ def test_on_finished_with_no_rows_does_not_mark_complete():
     panel._on_finished({"rowCount": 0})
 
     mock_record.mark_complete.assert_not_called()
+
+
+def test_max_filesize_spin_default_value():
+    """Max file size spinbox must default to 5 (GB)."""
+    panel = CollectorPanel()
+    assert panel._max_filesize_spin.value() == 5
+
+
+def test_max_filesize_spin_range():
+    """Spinbox range must be 0–500 GB."""
+    panel = CollectorPanel()
+    assert panel._max_filesize_spin.minimum() == 0
+    assert panel._max_filesize_spin.maximum() == 500
+
+
+def test_max_filesize_spin_special_value_text():
+    """Value 0 must display 'Unbegrenzt'."""
+    panel = CollectorPanel()
+    assert "Unbegrenzt" in panel._max_filesize_spin.specialValueText()

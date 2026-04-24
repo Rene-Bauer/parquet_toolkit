@@ -169,6 +169,24 @@ class CollectorPanel(QWidget):
         row3.addStretch()
         layout.addLayout(row3)
 
+        # Row 4: max output file size
+        row4 = QHBoxLayout()
+        row4.addWidget(QLabel("Max. Dateigröße:"))
+        self._max_filesize_spin = QSpinBox()
+        self._max_filesize_spin.setRange(0, 500)
+        self._max_filesize_spin.setValue(5)
+        self._max_filesize_spin.setSuffix(" GB")
+        self._max_filesize_spin.setSpecialValueText("Unbegrenzt")
+        self._max_filesize_spin.setFixedWidth(100)
+        self._max_filesize_spin.setToolTip(
+            "Maximale Größe einer Ausgabedatei.\n"
+            "Bei Überschreitung wird die Datei aufgeteilt (_part_001, _part_002, …).\n"
+            "'Unbegrenzt' = keine Aufteilung."
+        )
+        row4.addWidget(self._max_filesize_spin)
+        row4.addStretch()
+        layout.addLayout(row4)
+
         return box
 
     def _build_schema_group(self) -> QGroupBox:
@@ -381,6 +399,7 @@ class CollectorPanel(QWidget):
             ram_limit_mb=self._ram_spin.value(),
             autoscale=self._autoscale_check.isChecked(),
             selected_columns=selected_columns,
+            max_output_bytes=self._max_filesize_spin.value() * 1024 ** 3,
         )
         self._worker.listing_complete.connect(self._on_listing_complete)
         self._worker.progress.connect(self._on_progress)
@@ -458,8 +477,9 @@ class CollectorPanel(QWidget):
         row_count = result.get("rowCount", 0)
         if self._run_record is not None:
             if row_count > 0:
+                out_blobs = result.get("outputBlobs", [])
                 self._run_record.mark_complete(
-                    result.get("outputBlob", ""),
+                    out_blobs[0] if out_blobs else "",
                     row_count,
                 )
             else:
@@ -470,11 +490,17 @@ class CollectorPanel(QWidget):
         if row_count == 0:
             self._log_info("Collection complete: no matching rows found.")
         else:
-            out_blob = result.get("outputBlob", "")
+            out_blobs = result.get("outputBlobs", [])
             out_container = result.get("outputContainer", "")
-            self._log_info(
-                f"Collection complete: {row_count} rows → [{out_container}] {out_blob}"
-            )
+            if len(out_blobs) == 1:
+                self._log_info(
+                    f"Collection complete: {row_count} rows → [{out_container}] {out_blobs[0]}"
+                )
+            else:
+                self._log_info(
+                    f"Collection complete: {row_count} rows → [{out_container}] "
+                    f"{len(out_blobs)} part(s): {', '.join(out_blobs)}"
+                )
         self._resources_panel.clear_worker_throughput()
         self._request_worker_cleanup()
 
