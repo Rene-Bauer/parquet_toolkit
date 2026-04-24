@@ -78,6 +78,7 @@ def _make_worker(**kwargs):
 def test_worker_combines_rows_from_multiple_blobs():
     mock_client = MagicMock()
     mock_client.list_blobs.return_value = ["p/f1.parquet", "p/f2.parquet"]
+    mock_client.list_blob_prefixes.return_value = []
     mock_client.download_bytes.side_effect = _make_thread_safe_download_mock(
         _make_parquet_bytes("uid1", "dev1", 2),
         _make_parquet_bytes("uid1", "dev1", 3),
@@ -93,6 +94,7 @@ def test_worker_combines_rows_from_multiple_blobs():
 def test_worker_output_blob_name_is_correct():
     mock_client = MagicMock()
     mock_client.list_blobs.return_value = ["p/f1.parquet"]
+    mock_client.list_blob_prefixes.return_value = []
     mock_client.download_bytes.return_value = _make_parquet_bytes("uid1", "dev1", 2)
 
     with patch("gui.workers.BlobStorageClient", return_value=mock_client):
@@ -112,6 +114,7 @@ def test_worker_filters_only_matching_rows():
 
     mock_client = MagicMock()
     mock_client.list_blobs.return_value = ["p/f1.parquet"]
+    mock_client.list_blob_prefixes.return_value = []
     mock_client.download_bytes.return_value = buf.getvalue()
 
     with patch("gui.workers.BlobStorageClient", return_value=mock_client):
@@ -123,6 +126,7 @@ def test_worker_filters_only_matching_rows():
 def test_worker_no_match_skips_upload():
     mock_client = MagicMock()
     mock_client.list_blobs.return_value = ["p/f1.parquet"]
+    mock_client.list_blob_prefixes.return_value = []
     mock_client.download_bytes.return_value = _make_parquet_bytes("uid_other", "dev1", 3)
 
     with patch("gui.workers.BlobStorageClient", return_value=mock_client):
@@ -138,6 +142,7 @@ def test_worker_emits_cancelled_when_cancel_called():
     mock_client.download_bytes.return_value = _make_parquet_bytes("uid1", "dev1", 1)
 
     cancelled = []
+    mock_client.list_blob_prefixes.return_value = []
     with patch("gui.workers.BlobStorageClient", return_value=mock_client):
         worker = _make_worker()
         worker.cancelled.connect(lambda: cancelled.append(True))
@@ -163,6 +168,7 @@ def test_worker_emits_file_error_on_bad_blob_and_continues():
 
     mock_client = MagicMock()
     mock_client.list_blobs.return_value = ["p/bad.parquet", "p/good.parquet"]
+    mock_client.list_blob_prefixes.return_value = []
     mock_client.download_bytes.side_effect = _side_effect
 
     errors = []
@@ -185,6 +191,7 @@ def test_worker_output_has_correct_metadata():
 
     mock_client = MagicMock()
     mock_client.list_blobs.return_value = ["p/f1.parquet"]
+    mock_client.list_blob_prefixes.return_value = []
     mock_client.download_bytes.return_value = _make_parquet_bytes("uid1", "dev1", 2)
 
     captured_tables = []
@@ -211,6 +218,7 @@ def test_worker_output_has_correct_metadata():
 def test_worker_uses_separate_output_container():
     source_mock = MagicMock()
     source_mock.list_blobs.return_value = ["p/f1.parquet"]
+    source_mock.list_blob_prefixes.return_value = []
     source_mock.download_bytes.return_value = _make_parquet_bytes("uid1", "dev1", 2)
 
     output_mock = MagicMock()
@@ -323,6 +331,7 @@ def test_paused_worker_stops_emitting_progress():
 
     mock_client = MagicMock()
     mock_client.list_blobs.return_value = [f"p/f{i}.parquet" for i in range(8)]
+    mock_client.list_blob_prefixes.return_value = []
     mock_client.download_bytes.side_effect = _slow_download
 
     with patch("gui.workers.BlobStorageClient", return_value=mock_client):
@@ -375,6 +384,7 @@ def test_predicate_pushdown_calls_read_table_with_filters():
 
     mock_client = MagicMock()
     mock_client.list_blobs.return_value = ["p/f1.parquet"]
+    mock_client.list_blob_prefixes.return_value = []
     mock_client.download_bytes.return_value = _make_parquet_bytes("uid1", "dev1", 2)
 
     read_table_calls = []
@@ -414,6 +424,7 @@ def test_writer_splits_output_when_max_output_bytes_exceeded():
     """With a tiny max_output_bytes, each blob produces a separate _part_NNN upload."""
     mock_client = MagicMock()
     mock_client.list_blobs.return_value = ["p/f1.parquet", "p/f2.parquet"]
+    mock_client.list_blob_prefixes.return_value = []
     mock_client.download_bytes.side_effect = _make_thread_safe_download_mock(
         _make_parquet_bytes("uid1", "dev1", 5),
         _make_parquet_bytes("uid1", "dev1", 5),
@@ -448,6 +459,7 @@ def test_writer_no_splitting_when_max_output_bytes_zero():
     """Default (max_output_bytes=0) produces a single upload without _part_ suffix."""
     mock_client = MagicMock()
     mock_client.list_blobs.return_value = ["p/f1.parquet"]
+    mock_client.list_blob_prefixes.return_value = []
     mock_client.download_bytes.return_value = _make_parquet_bytes("uid1", "dev1", 3)
 
     upload_calls = []
@@ -504,3 +516,98 @@ def test_start_part_produces_part_numbered_output(monkeypatch):
 
     assert len(upload_calls) == 1
     assert "_part_003" in upload_calls[0]
+
+
+# --- archive mode ---
+
+def test_archive_mode_skips_completed_subfolder():
+    """When checkpoint marks subfolder as done, no blobs are downloaded for it."""
+    from unittest.mock import MagicMock, patch
+
+    raw = _make_parquet_bytes("uid1", "dev1", 3)
+    download_calls = []
+
+    def fake_download(blob_name, timeout=None):
+        download_calls.append(blob_name)
+        return raw
+
+    with patch("gui.workers.BlobStorageClient") as MockClient, \
+         patch("parquet_transform.checkpoint.ArchiveCheckpoint.load_or_create") as mock_cp_ctor:
+
+        mock_cp = MagicMock()
+        mock_cp.next_part = 2
+        mock_cp.total_rows = 500
+        mock_cp.done_count = 1
+        mock_cp.is_done.side_effect = lambda sf: sf == "26-02-2026"
+        mock_cp.path = MagicMock()
+        mock_cp.path.name = "test_checkpoint.json"
+        mock_cp_ctor.return_value = mock_cp
+
+        mock_instance = MockClient.return_value
+        # Two subfolders; first is already done
+        mock_instance.list_blob_prefixes.return_value = ["26-02-2026", "26-03-2026"]
+        mock_instance.list_blobs.return_value = ["26-03-2026/batch1.parquet"]
+        mock_instance.download_bytes.side_effect = fake_download
+        mock_instance.upload_stream = MagicMock()
+
+        worker = _make_worker(source_prefix="archive/")
+        worker.run()
+
+    # Only the second subfolder's blob was downloaded
+    assert len(download_calls) == 1
+    assert "26-03-2026" in download_calls[0]
+
+
+def test_archive_mode_emits_finished_with_total_rows():
+    """finished signal carries total rows from checkpoint after all subfolders."""
+    from unittest.mock import MagicMock, patch
+
+    raw = _make_parquet_bytes("uid1", "dev1", 3)
+    finished_results = []
+
+    with patch("gui.workers.BlobStorageClient") as MockClient, \
+         patch("parquet_transform.checkpoint.ArchiveCheckpoint.load_or_create") as mock_cp_ctor:
+
+        mock_cp = MagicMock()
+        mock_cp.next_part = 1
+        mock_cp.total_rows = 999
+        mock_cp.done_count = 0
+        mock_cp.is_done.return_value = False
+        mock_cp.path = MagicMock()
+        mock_cp.path.name = "test_checkpoint.json"
+        mock_cp_ctor.return_value = mock_cp
+
+        mock_instance = MockClient.return_value
+        mock_instance.list_blob_prefixes.return_value = ["26-02-2026"]
+        mock_instance.list_blobs.return_value = ["26-02-2026/b.parquet"]
+        mock_instance.download_bytes.return_value = raw
+        mock_instance.upload_stream = MagicMock()
+
+        worker = _make_worker(source_prefix="archive/")
+        worker.finished.connect(lambda r: finished_results.append(r))
+        worker.run()
+
+    assert finished_results
+    assert finished_results[-1]["rowCount"] == mock_cp.total_rows
+
+
+def test_flat_mode_used_when_no_subfolders():
+    """When list_blob_prefixes returns [], run() uses existing flat behavior."""
+    from unittest.mock import MagicMock, patch
+
+    raw = _make_parquet_bytes("uid1", "dev1", 3)
+    finished_results = []
+
+    with patch("gui.workers.BlobStorageClient") as MockClient:
+        mock_instance = MockClient.return_value
+        mock_instance.list_blob_prefixes.return_value = []   # no subfolders
+        mock_instance.list_blobs.return_value = ["flat/b.parquet"]
+        mock_instance.download_bytes.return_value = raw
+        mock_instance.upload_stream = MagicMock()
+
+        worker = _make_worker(source_prefix="flat/")
+        worker.finished.connect(lambda r: finished_results.append(r))
+        worker.run()
+
+    assert finished_results
+    assert finished_results[-1].get("rowCount", 0) >= 0

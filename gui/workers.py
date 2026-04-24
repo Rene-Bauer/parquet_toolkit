@@ -17,9 +17,9 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
-from parquet_transform.checkpoint import FailedList, RunCheckpoint
+from parquet_transform.checkpoint import ArchiveCheckpoint, FailedList, RunCheckpoint
 from parquet_transform.processor import ColumnConfig, apply_transforms, compute_output_name
 from parquet_transform.scaler import AdaptiveScaler
 from parquet_transform.storage import BlobStorageClient
@@ -990,6 +990,9 @@ class DataCollectorWorker(QThread):
         self._cancel_reason = "user"
         self._cancel_event.set()
         self._pause_event.set()  # unblock any paused producers so they can exit
+        # Forward cancellation to a running inner worker (archive mode)
+        if self._archive_inner is not None:
+            self._archive_inner.cancel()
 
     def pause(self) -> None:
         if self._pause_event.is_set():   # only act if currently running
@@ -1000,6 +1003,126 @@ class DataCollectorWorker(QThread):
         if not self._pause_event.is_set():   # only act if currently paused
             self._pause_event.set()
             self.resumed.emit()
+
+    def _run_archive_mode(self, subfolders: list[str]) -> None:
+        """Process *subfolders* one-by-one with a local ArchiveCheckpoint.
+
+        Each subfolder is a synchronous mini-run using a fresh DataCollectorWorker
+        with _leaf=True (no further subfolder detection).  The checkpoint is updated
+        after each successful subfolder so interrupted runs resume from where they
+        left off.
+        """
+        checkpoint = ArchiveCheckpoint.load_or_create(
+            container=self._container_name,
+            source_prefix=self._source_prefix,
+            filter_col=self._filter_col,
+            filter_values=self._filter_values,
+            output_prefix=self._output_prefix,
+            output_container=self._output_container,
+        )
+
+        n = len(subfolders)
+        skipped = checkpoint.done_count
+        self.log_message.emit(
+            f"[Archive] {n} Subfolder gefunden — "
+            f"{skipped} bereits erledigt, {n - skipped} ausstehend. "
+            f"Checkpoint: {checkpoint.path.name}"
+        )
+
+        for idx, subfolder in enumerate(subfolders):
+            if self._cancel_event.is_set():
+                self.cancelled.emit()
+                return
+
+            if checkpoint.is_done(subfolder):
+                self.log_message.emit(
+                    f"[Archive] Subfolder {idx + 1}/{n}: {subfolder} — übersprungen"
+                )
+                continue
+
+            self.log_message.emit(
+                f"[Archive] Subfolder {idx + 1}/{n}: {subfolder} — wird verarbeitet …"
+            )
+
+            subfolder_prefix = self._source_prefix.rstrip("/") + "/" + subfolder
+
+            inner = DataCollectorWorker(
+                connection_string=self._conn,
+                container=self._container_name,
+                source_prefix=subfolder_prefix,
+                output_prefix=self._output_prefix,
+                filter_col=self._filter_col,
+                filter_values=self._filter_values,
+                output_container=self._output_container,
+                max_workers=self._max_workers,
+                ram_limit_mb=self._ram_limit_bytes // (1024 * 1024),
+                autoscale=self._autoscale,
+                selected_columns=self._selected_columns,
+                max_output_bytes=self._max_output_bytes,
+                start_part=checkpoint.next_part,
+                _leaf=True,
+            )
+
+            # Capture result and cancellation synchronously.
+            # DirectConnection: slots execute in the current thread immediately
+            # when inner.run() emits — no event loop needed.
+            _result: dict = {}
+            _was_cancelled = [False]
+
+            inner.finished.connect(
+                lambda r: _result.update(r),
+                Qt.ConnectionType.DirectConnection,
+            )
+            inner.cancelled.connect(
+                lambda: _was_cancelled.__setitem__(0, True),
+                Qt.ConnectionType.DirectConnection,
+            )
+
+            # Forward display signals to panel (panel uses AutoConnection → QueuedConnection
+            # across threads, so these are safely delivered to the main thread).
+            inner.progress.connect(self.progress, Qt.ConnectionType.DirectConnection)
+            inner.log_message.connect(self.log_message, Qt.ConnectionType.DirectConnection)
+            inner.file_error.connect(self.file_error, Qt.ConnectionType.DirectConnection)
+            inner.listing_complete.connect(
+                self.listing_complete, Qt.ConnectionType.DirectConnection
+            )
+            inner.workers_scaled.connect(
+                self.workers_scaled, Qt.ConnectionType.DirectConnection
+            )
+            inner.paused.connect(self.paused, Qt.ConnectionType.DirectConnection)
+            inner.resumed.connect(self.resumed, Qt.ConnectionType.DirectConnection)
+
+            self._archive_inner = inner
+            inner.run()   # synchronous — runs in this QThread's thread
+            self._archive_inner = None
+
+            if _was_cancelled[0] or self._cancel_event.is_set():
+                self.cancelled.emit()
+                return
+
+            rows = _result.get("rowCount", 0)
+            parts_produced = len(_result.get("outputBlobs", []))
+            checkpoint.mark_done(subfolder, parts_produced, rows)
+
+            if rows > 0:
+                self.log_message.emit(
+                    f"[Archive] Subfolder {subfolder} fertig: "
+                    f"{rows:,} Zeilen, {parts_produced} Teil(e)"
+                )
+            else:
+                self.log_message.emit(
+                    f"[Archive] Subfolder {subfolder} fertig: keine Treffer"
+                )
+
+        self.log_message.emit(
+            f"[Archive] Alle {n} Subfolder verarbeitet — "
+            f"{checkpoint.total_rows:,} Zeilen gesamt"
+        )
+        self.finished.emit({
+            "rowCount": checkpoint.total_rows,
+            "outputBlobs": [],
+            "outputContainer": self._output_container,
+        })
 
     def run(self) -> None:
         import os
@@ -1024,6 +1147,25 @@ class DataCollectorWorker(QThread):
         _emitted = [False]
 
         self._cancel_reason = None
+
+        # ── Subfolder detection (archive mode) ───────────────────────────────
+        # When the source prefix contains virtual subdirectories, process them
+        # one-by-one with a local checkpoint so interrupted runs can resume.
+        # _leaf=True suppresses this check for inner runs (prevents recursion).
+        if not self._leaf:
+            try:
+                _probe_client = BlobStorageClient(self._conn, self._container_name)
+                try:
+                    _subfolders = _probe_client.list_blob_prefixes(self._source_prefix)
+                finally:
+                    _probe_client.close()
+            except Exception:
+                _subfolders = []
+
+            if _subfolders:
+                self._run_archive_mode(_subfolders)
+                return
+        # ── End subfolder detection ───────────────────────────────────────────
 
         try:
             source_client = BlobStorageClient(self._conn, self._container_name)
