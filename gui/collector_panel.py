@@ -475,9 +475,10 @@ class CollectorPanel(QWidget):
         self._eta_label.setText("")
         self._progress.setVisible(False)
         row_count = result.get("rowCount", 0)
+        out_blobs = result.get("outputBlobs", [])
+        out_container = result.get("outputContainer", "")
         if self._run_record is not None:
             if row_count > 0:
-                out_blobs = result.get("outputBlobs", [])
                 self._run_record.mark_complete(
                     out_blobs[0] if out_blobs else "",
                     row_count,
@@ -489,18 +490,19 @@ class CollectorPanel(QWidget):
             self._run_record = None
         if row_count == 0:
             self._log_info("Collection complete: no matching rows found.")
+        elif not out_blobs:
+            self._log_info(
+                f"Collection complete: {row_count} rows (no output blobs reported)"
+            )
+        elif len(out_blobs) == 1:
+            self._log_info(
+                f"Collection complete: {row_count} rows → [{out_container}] {out_blobs[0]}"
+            )
         else:
-            out_blobs = result.get("outputBlobs", [])
-            out_container = result.get("outputContainer", "")
-            if len(out_blobs) == 1:
-                self._log_info(
-                    f"Collection complete: {row_count} rows → [{out_container}] {out_blobs[0]}"
-                )
-            else:
-                self._log_info(
-                    f"Collection complete: {row_count} rows → [{out_container}] "
-                    f"{len(out_blobs)} part(s): {', '.join(out_blobs)}"
-                )
+            self._log_info(
+                f"Collection complete: {row_count} rows → [{out_container}] "
+                f"{len(out_blobs)} part(s): {', '.join(out_blobs)}"
+            )
         self._resources_panel.clear_worker_throughput()
         self._request_worker_cleanup()
 
