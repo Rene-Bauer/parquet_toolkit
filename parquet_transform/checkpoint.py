@@ -398,6 +398,8 @@ class ArchiveCheckpoint:
     same file without the caller needing to track a path.
 
     Uses atomic writes (temp + os.replace) to survive crashes mid-write.
+
+    Assumes the repository root is writable at runtime; not suitable for read-only installed distributions.
     """
 
     def __init__(self, path: Path, data: dict) -> None:
@@ -508,6 +510,10 @@ class ArchiveCheckpoint:
         Idempotent: calling twice for the same subfolder is a no-op after
         the first call.
         """
+        if parts_produced < 0 or rows < 0:
+            raise ValueError(
+                f"parts_produced and rows must be >= 0, got {parts_produced!r}, {rows!r}"
+            )
         with self._lock:
             done: list[str] = self._data.setdefault("subfolders_done", [])
             if subfolder in done:
@@ -524,6 +530,7 @@ class ArchiveCheckpoint:
 
     def _write(self) -> None:
         """Atomic write: temp file + os.replace."""
+        # Cannot reuse module-level _atomic_write(); that function targets _CHECKPOINTS_DIR.
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as f:

@@ -109,3 +109,17 @@ def test_different_filter_values_produce_different_files(tmp_path):
         _checkpoint_dir=tmp_path,
     )
     assert cp_a.path != cp_b.path
+
+
+def test_different_filter_cols_produce_different_files(tmp_path):
+    cp_a = ArchiveCheckpoint.load_or_create(
+        container="c", source_prefix="p/", filter_col="SenderUid",
+        filter_values=["uid1"], output_prefix="out/", output_container="c",
+        _checkpoint_dir=tmp_path,
+    )
+    cp_b = ArchiveCheckpoint.load_or_create(
+        container="c", source_prefix="p/", filter_col="DeviceUid",
+        filter_values=["uid1"], output_prefix="out/", output_container="c",
+        _checkpoint_dir=tmp_path,
+    )
+    assert cp_a.path != cp_b.path
