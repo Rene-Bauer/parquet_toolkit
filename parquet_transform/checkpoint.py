@@ -376,3 +376,156 @@ class CollectorRunRecord:
             self._data["row_count"] = 0
             self._data["updated_at"] = _now()
             _atomic_write(self._path, self._data)
+
+
+# ---------------------------------------------------------------------------
+# ArchiveCheckpoint
+# ---------------------------------------------------------------------------
+
+_ARCHIVE_CHECKPOINT_DIR: Path = Path(__file__).parent.parent / "CollectorCheckpoint"
+"""Default directory for archive checkpoints: repo_root/CollectorCheckpoint/"""
+
+
+class ArchiveCheckpoint:
+    """
+    Per-run checkpoint for archive collection (subfolder-by-subfolder mode).
+
+    Stored in CollectorCheckpoint/ at the repository root (not in the user's
+    home directory — archive runs are machine-local and the folder is gitignored).
+
+    Filename is derived deterministically from (container, source_prefix,
+    filter_col, filter_values) so the same logical run always maps to the
+    same file without the caller needing to track a path.
+
+    Uses atomic writes (temp + os.replace) to survive crashes mid-write.
+    """
+
+    def __init__(self, path: Path, data: dict) -> None:
+        self._path = path
+        self._data = data
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_path(
+        container: str,
+        source_prefix: str,
+        filter_col: str,
+        filter_values: list[str],
+        checkpoint_dir: Path,
+    ) -> Path:
+        sorted_vals = sorted(filter_values)
+        raw = f"{container}/{source_prefix}/{filter_col}/{','.join(sorted_vals)}"
+        digest = hashlib.sha1(raw.encode()).hexdigest()[:8]
+        c  = re.sub(r"[^a-zA-Z0-9]", "_", container)
+        p  = re.sub(r"[^a-zA-Z0-9]", "_", source_prefix)
+        fc = re.sub(r"[^a-zA-Z0-9]", "_", filter_col)
+        return checkpoint_dir / f"{c}__{p}__{fc}__{digest}__archive.json"
+
+    @staticmethod
+    def load_or_create(
+        container: str,
+        source_prefix: str,
+        filter_col: str,
+        filter_values: list[str],
+        output_prefix: str,
+        output_container: str,
+        _checkpoint_dir: Path | None = None,
+    ) -> "ArchiveCheckpoint":
+        """Load an existing checkpoint or create a fresh one.
+
+        *_checkpoint_dir* overrides the default storage location and is
+        intended for tests only.
+
+        Raises RuntimeError if the checkpoint file exists but is corrupt.
+        """
+        directory = _checkpoint_dir or _ARCHIVE_CHECKPOINT_DIR
+        path = ArchiveCheckpoint._make_path(
+            container, source_prefix, filter_col, filter_values, directory
+        )
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"Archive checkpoint is corrupt and cannot be loaded: {path}\n"
+                        f"Delete the file to start fresh. Detail: {exc}"
+                    ) from exc
+        else:
+            data = {
+                "container": container,
+                "source_prefix": source_prefix,
+                "filter_col": filter_col,
+                "filter_values": sorted(filter_values),
+                "output_prefix": output_prefix,
+                "output_container": output_container,
+                "subfolders_done": [],
+                "next_part": 1,
+                "total_rows": 0,
+                "created_at": _now(),
+                "updated_at": _now(),
+            }
+        return ArchiveCheckpoint(path, data)
+
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+
+    def is_done(self, subfolder: str) -> bool:
+        """True if *subfolder* was previously marked complete."""
+        return subfolder in self._data.get("subfolders_done", [])
+
+    @property
+    def next_part(self) -> int:
+        """Part number to assign to the first output file of the next subfolder."""
+        return self._data.get("next_part", 1)
+
+    @property
+    def total_rows(self) -> int:
+        """Cumulative row count across all completed subfolders."""
+        return self._data.get("total_rows", 0)
+
+    @property
+    def done_count(self) -> int:
+        """Number of subfolders marked complete."""
+        return len(self._data.get("subfolders_done", []))
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    # ------------------------------------------------------------------
+    # Mutations
+    # ------------------------------------------------------------------
+
+    def mark_done(self, subfolder: str, parts_produced: int, rows: int) -> None:
+        """Record *subfolder* as complete and persist atomically.
+
+        Idempotent: calling twice for the same subfolder is a no-op after
+        the first call.
+        """
+        with self._lock:
+            done: list[str] = self._data.setdefault("subfolders_done", [])
+            if subfolder in done:
+                return  # already recorded — don't double-count
+            done.append(subfolder)
+            self._data["next_part"] = self._data.get("next_part", 1) + parts_produced
+            self._data["total_rows"] = self._data.get("total_rows", 0) + rows
+            self._data["updated_at"] = _now()
+            self._write()
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _write(self) -> None:
+        """Atomic write: temp file + os.replace."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self._data, f, indent=2)
+        os.replace(tmp, self._path)
