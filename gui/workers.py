@@ -1092,6 +1092,7 @@ class DataCollectorWorker(QThread):
             inner.paused.connect(self.paused, Qt.ConnectionType.DirectConnection)
             inner.resumed.connect(self.resumed, Qt.ConnectionType.DirectConnection)
 
+            checkpoint.mark_in_progress(subfolder)
             self._subfolder_inner = inner
             inner.run()   # synchronous — runs in this QThread's thread
             self._subfolder_inner = None

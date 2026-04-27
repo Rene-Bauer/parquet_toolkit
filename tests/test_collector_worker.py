@@ -611,3 +611,34 @@ def test_flat_mode_used_when_no_subfolders():
 
     assert finished_results
     assert finished_results[-1].get("rowCount", 0) >= 0
+
+
+def test_subfolder_mode_calls_mark_in_progress_before_inner_run():
+    """mark_in_progress must be called for each non-skipped subfolder."""
+    from unittest.mock import MagicMock, patch, call
+
+    raw = _make_parquet_bytes("uid1", "dev1", 3)
+
+    with patch("gui.workers.BlobStorageClient") as MockClient, \
+         patch("parquet_transform.checkpoint.SubfolderCheckpoint.load_or_create") as mock_cp_ctor:
+
+        mock_cp = MagicMock()
+        mock_cp.next_part = 1
+        mock_cp.total_rows = 0
+        mock_cp.done_count = 0
+        mock_cp.is_done.return_value = False
+        mock_cp.path = MagicMock()
+        mock_cp.path.name = "test_checkpoint.json"
+        mock_cp_ctor.return_value = mock_cp
+
+        mock_instance = MockClient.return_value
+        mock_instance.list_blob_prefixes.return_value = ["26-02-2026", "26-03-2026"]
+        mock_instance.list_blobs.return_value = []  # no blobs → inner run exits fast
+        mock_instance.upload_stream = MagicMock()
+
+        worker = _make_worker(source_prefix="data/")
+        worker.run()
+
+    assert mock_cp.mark_in_progress.call_count == 2
+    mock_cp.mark_in_progress.assert_any_call("26-02-2026")
+    mock_cp.mark_in_progress.assert_any_call("26-03-2026")
