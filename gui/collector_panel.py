@@ -33,7 +33,7 @@ from gui.collector_schema_table import CollectorSchemaTable
 from gui.resources_panel import ResourcesPanel
 from gui.workers import DataCollectorWorker, SchemaLoaderWorker, _format_duration
 from parquet_transform.collector import _REQUIRED_COLS
-from parquet_transform.checkpoint import CollectorRunRecord
+from parquet_transform.checkpoint import CollectorRunRecord, SubfolderCheckpoint
 
 
 class CollectorPanel(QWidget):
@@ -312,49 +312,93 @@ class CollectorPanel(QWidget):
             self._log_error("Enter at least one ID.")
             return
 
+        source_prefix = self._source_edit.text().strip()
+        filter_col = self._filter_combo.currentText()
+
+        # ── SubfolderCheckpoint detection ─────────────────────────────────────
+        _cp_path = SubfolderCheckpoint.checkpoint_path(
+            container, source_prefix, filter_col, filter_values,
+        )
+        _skip_run_record_dialogs = False
+        _start_fresh = False
+        if _cp_path.exists():
+            try:
+                _cp = SubfolderCheckpoint.load_existing(_cp_path)
+            except RuntimeError as exc:
+                self._log_error(f"Corrupt subfolder checkpoint (delete to reset): {exc}")
+                return
+            if _cp is not None and (_cp.done_count > 0 or _cp.in_progress_subfolder):
+                from PyQt6.QtWidgets import QMessageBox
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Previous Run Interrupted")
+                lines = [f"{_cp.done_count} subfolder(s) completed."]
+                if _cp.in_progress_subfolder:
+                    lines.append(
+                        f"Interrupted on: \"{_cp.in_progress_subfolder}\" — "
+                        "resuming will rerun it from the beginning."
+                    )
+                msg.setText("\n".join(lines))
+                resume_btn = msg.addButton("Resume", QMessageBox.ButtonRole.AcceptRole)
+                fresh_btn = msg.addButton("Start Fresh", QMessageBox.ButtonRole.DestructiveRole)
+                msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+                msg.exec()
+                clicked = msg.clickedButton()
+                if clicked == resume_btn:
+                    _skip_run_record_dialogs = True
+                elif clicked == fresh_btn:
+                    _cp_path.unlink(missing_ok=True)
+                    _skip_run_record_dialogs = True
+                    _start_fresh = True
+                else:
+                    return  # Cancel
+        # ── end SubfolderCheckpoint detection ─────────────────────────────────
+
         # Last Run Detection: check for a previous run with the same key
         try:
             run_record = CollectorRunRecord.load_or_create(
                 container,
-                self._source_edit.text().strip(),
-                self._filter_combo.currentText(),
+                source_prefix,
+                filter_col,
                 filter_values,
             )
         except RuntimeError as exc:
             self._log_error(f"Corrupt run record (delete file to reset): {exc}")
             return
 
-        if run_record.is_complete():
-            from PyQt6.QtWidgets import QMessageBox
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Previous Run Found")
-            msg.setText(
-                f"A previous collection run completed successfully.\n\n"
-                f"Output blob:  {run_record.output_blob}\n"
-                f"Row count:    {run_record.row_count}\n\n"
-                "Re-run and overwrite the output?"
-            )
-            rerun_btn = msg.addButton("Re-run", QMessageBox.ButtonRole.AcceptRole)
-            msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-            msg.exec()
-            if msg.clickedButton() != rerun_btn:
-                return
+        if _start_fresh:
             run_record.reset()
+        elif not _skip_run_record_dialogs:
+            if run_record.is_complete():
+                from PyQt6.QtWidgets import QMessageBox
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Previous Run Found")
+                msg.setText(
+                    f"A previous collection run completed successfully.\n\n"
+                    f"Output blob:  {run_record.output_blob}\n"
+                    f"Row count:    {run_record.row_count}\n\n"
+                    "Re-run and overwrite the output?"
+                )
+                rerun_btn = msg.addButton("Re-run", QMessageBox.ButtonRole.AcceptRole)
+                msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+                msg.exec()
+                if msg.clickedButton() != rerun_btn:
+                    return
+                run_record.reset()
 
-        elif run_record.status == "in_progress":
-            from PyQt6.QtWidgets import QMessageBox
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Previous Run Interrupted")
-            msg.setText(
-                "A previous collection run was interrupted before completing.\n\n"
-                "Start a fresh run?"
-            )
-            fresh_btn = msg.addButton("Start Fresh", QMessageBox.ButtonRole.AcceptRole)
-            msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-            msg.exec()
-            if msg.clickedButton() != fresh_btn:
-                return
-            run_record.reset()
+            elif run_record.status == "in_progress":
+                from PyQt6.QtWidgets import QMessageBox
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Previous Run Interrupted")
+                msg.setText(
+                    "A previous collection run was interrupted before completing.\n\n"
+                    "Start a fresh run?"
+                )
+                fresh_btn = msg.addButton("Start Fresh", QMessageBox.ButtonRole.AcceptRole)
+                msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+                msg.exec()
+                if msg.clickedButton() != fresh_btn:
+                    return
+                run_record.reset()
 
         output_prefix = self._output_edit.text().strip()
         if not output_prefix:
@@ -383,16 +427,16 @@ class CollectorPanel(QWidget):
             f" [{len(selected_columns)} columns]" if selected_columns is not None else ""
         )
         self._log_info(
-            f"Starting collection: {self._filter_combo.currentText()} "
+            f"Starting collection: {filter_col} "
             f"{filter_values} → {output_prefix}{col_note}"
         )
 
         self._worker = DataCollectorWorker(
             connection_string=conn,
             container=container,
-            source_prefix=self._source_edit.text().strip(),
+            source_prefix=source_prefix,
             output_prefix=output_prefix,
-            filter_col=self._filter_combo.currentText(),
+            filter_col=filter_col,
             filter_values=filter_values,
             output_container=self._output_container_edit.text().strip(),
             max_workers=self._workers_spin.value(),

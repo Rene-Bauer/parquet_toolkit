@@ -269,3 +269,165 @@ def test_max_filesize_spin_special_value_text():
     """Value 0 must display 'Unbegrenzt'."""
     panel = CollectorPanel()
     assert "Unbegrenzt" in panel._max_filesize_spin.specialValueText()
+
+
+import json
+from unittest.mock import MagicMock, patch
+
+
+def _fill_panel(panel) -> None:
+    """Fill required fields with valid dummy values."""
+    panel._conn_edit.setText("fake_conn")
+    panel._container_edit.setText("mycontainer")
+    panel._source_edit.setText("data/")
+    panel._output_edit.setText("output/")
+    panel._ids_edit.setPlainText("uid1")
+    # SenderUid is the first item in the combo — already selected by default
+
+
+def _fake_cp_json(done: list, in_progress) -> str:
+    return json.dumps({
+        "container": "mycontainer",
+        "source_prefix": "data/",
+        "filter_col": "SenderUid",
+        "filter_values": ["uid1"],
+        "output_prefix": "output/",
+        "output_container": "mycontainer",
+        "subfolders_done": done,
+        "in_progress_subfolder": in_progress,
+        "next_part": len(done) + 1,
+        "total_rows": len(done) * 500,
+        "created_at": "2026-01-01T00:00:00",
+        "updated_at": "2026-01-01T00:00:00",
+    })
+
+
+def test_start_fresh_deletes_subfolder_checkpoint(tmp_path):
+    """Clicking Start Fresh in the subfolder dialog removes the checkpoint file."""
+    from parquet_transform.checkpoint import SubfolderCheckpoint
+
+    panel = CollectorPanel()
+    _fill_panel(panel)
+
+    fake_cp_path = tmp_path / "fake__subfolder.json"
+    fake_cp_path.write_text(
+        _fake_cp_json(done=["26-01-2026", "26-02-2026"], in_progress="26-03-2026"),
+        encoding="utf-8",
+    )
+
+    mock_rr = MagicMock()
+    mock_rr.is_complete.return_value = False
+    mock_rr.status = "none"
+
+    with patch.object(SubfolderCheckpoint, "checkpoint_path", return_value=fake_cp_path), \
+         patch("gui.collector_panel.CollectorRunRecord.load_or_create", return_value=mock_rr), \
+         patch("gui.workers.DataCollectorWorker.start"), \
+         patch("PyQt6.QtWidgets.QMessageBox") as MockMB:
+
+        fresh_btn = MagicMock()
+
+        def add_button(label, role):
+            if label == "Start Fresh":
+                return fresh_btn
+            return MagicMock()
+
+        mb_instance = MagicMock()
+        MockMB.return_value = mb_instance
+        mb_instance.addButton.side_effect = add_button
+        mb_instance.clickedButton.return_value = fresh_btn
+
+        panel._on_collect()
+
+    assert not fake_cp_path.exists()
+
+
+def test_resume_keeps_subfolder_checkpoint(tmp_path):
+    """Clicking Resume in the subfolder dialog leaves the checkpoint file untouched."""
+    from parquet_transform.checkpoint import SubfolderCheckpoint
+
+    panel = CollectorPanel()
+    _fill_panel(panel)
+
+    fake_cp_path = tmp_path / "fake__subfolder.json"
+    fake_cp_path.write_text(
+        _fake_cp_json(done=["26-01-2026"], in_progress="26-02-2026"),
+        encoding="utf-8",
+    )
+
+    mock_rr = MagicMock()
+    mock_rr.is_complete.return_value = False
+    mock_rr.status = "none"
+
+    with patch.object(SubfolderCheckpoint, "checkpoint_path", return_value=fake_cp_path), \
+         patch("gui.collector_panel.CollectorRunRecord.load_or_create", return_value=mock_rr), \
+         patch("gui.workers.DataCollectorWorker.start"), \
+         patch("PyQt6.QtWidgets.QMessageBox") as MockMB:
+
+        resume_btn = MagicMock()
+
+        def add_button(label, role):
+            if label == "Resume":
+                return resume_btn
+            return MagicMock()
+
+        mb_instance = MagicMock()
+        MockMB.return_value = mb_instance
+        mb_instance.addButton.side_effect = add_button
+        mb_instance.clickedButton.return_value = resume_btn
+
+        panel._on_collect()
+
+    assert fake_cp_path.exists()
+
+
+def test_cancel_subfolder_dialog_aborts_collection(tmp_path):
+    """Clicking Cancel in the subfolder dialog does not start a worker."""
+    from parquet_transform.checkpoint import SubfolderCheckpoint
+
+    panel = CollectorPanel()
+    _fill_panel(panel)
+
+    fake_cp_path = tmp_path / "fake__subfolder.json"
+    fake_cp_path.write_text(
+        _fake_cp_json(done=["26-01-2026"], in_progress="26-02-2026"),
+        encoding="utf-8",
+    )
+
+    with patch.object(SubfolderCheckpoint, "checkpoint_path", return_value=fake_cp_path), \
+         patch("gui.collector_panel.CollectorRunRecord.load_or_create") as mock_rr_ctor, \
+         patch("PyQt6.QtWidgets.QMessageBox") as MockMB:
+
+        cancel_btn = MagicMock()
+
+        mb_instance = MagicMock()
+        MockMB.return_value = mb_instance
+        mb_instance.addButton.return_value = MagicMock()
+        mb_instance.clickedButton.return_value = cancel_btn  # not resume or fresh
+
+        panel._on_collect()
+
+    # CollectorRunRecord was never loaded (cancelled before reaching that block)
+    mock_rr_ctor.assert_not_called()
+    assert panel._worker is None
+
+
+def test_no_subfolder_checkpoint_uses_run_record_flow(tmp_path):
+    """When no SubfolderCheckpoint exists, the normal CollectorRunRecord flow runs."""
+    from parquet_transform.checkpoint import SubfolderCheckpoint
+
+    panel = CollectorPanel()
+    _fill_panel(panel)
+
+    non_existent = tmp_path / "does_not_exist.json"
+
+    mock_rr = MagicMock()
+    mock_rr.is_complete.return_value = False
+    mock_rr.status = "none"
+
+    with patch.object(SubfolderCheckpoint, "checkpoint_path", return_value=non_existent), \
+         patch("gui.collector_panel.CollectorRunRecord.load_or_create", return_value=mock_rr) as mock_rr_ctor, \
+         patch("gui.workers.DataCollectorWorker.start"):
+
+        panel._on_collect()
+
+    mock_rr_ctor.assert_called_once()
