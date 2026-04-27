@@ -7,7 +7,7 @@ import threading
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 from PyQt6.QtWidgets import QApplication
 _app = QApplication.instance() or QApplication(sys.argv)
@@ -615,10 +615,6 @@ def test_flat_mode_used_when_no_subfolders():
 
 def test_subfolder_mode_calls_mark_in_progress_before_inner_run():
     """mark_in_progress must be called for each non-skipped subfolder."""
-    from unittest.mock import MagicMock, patch, call
-
-    raw = _make_parquet_bytes("uid1", "dev1", 3)
-
     with patch("gui.workers.BlobStorageClient") as MockClient, \
          patch("parquet_transform.checkpoint.SubfolderCheckpoint.load_or_create") as mock_cp_ctor:
 
