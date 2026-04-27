@@ -19,7 +19,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
-from parquet_transform.checkpoint import ArchiveCheckpoint, FailedList, RunCheckpoint
+from parquet_transform.checkpoint import SubfolderCheckpoint, FailedList, RunCheckpoint
 from parquet_transform.processor import ColumnConfig, apply_transforms, compute_output_name
 from parquet_transform.scaler import AdaptiveScaler
 from parquet_transform.storage import BlobStorageClient
@@ -960,8 +960,8 @@ class DataCollectorWorker(QThread):
         autoscale: bool = True,
         selected_columns: list[str] | None = None,
         max_output_bytes: int = 0,
-        start_part: int | None = None,   # when set, always use _part_NNN naming (archive mode)
-        _leaf: bool = False,             # internal: prevents subfolder detection recursion
+        start_part: int | None = None,   # when set, always use _part_NNN naming (subfolder mode)
+        _is_subfolder_run: bool = False, # internal: prevents subfolder detection recursion
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -978,21 +978,21 @@ class DataCollectorWorker(QThread):
         self._selected_columns = selected_columns
         self._max_output_bytes = max_output_bytes
         self._start_part = start_part
-        self._leaf = _leaf
+        self._is_subfolder_run = _is_subfolder_run
         self._worker_count = max_workers
         self._cancel_event = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()  # starts unpaused
         self._cancel_reason: str | None = None
-        self._archive_inner: "DataCollectorWorker | None" = None
+        self._subfolder_inner: "DataCollectorWorker | None" = None
 
     def cancel(self) -> None:
         self._cancel_reason = "user"
         self._cancel_event.set()
         self._pause_event.set()  # unblock any paused producers so they can exit
-        # Forward cancellation to a running inner worker (archive mode)
-        if self._archive_inner is not None:
-            self._archive_inner.cancel()
+        # Forward cancellation to a running inner worker (subfolder mode)
+        if self._subfolder_inner is not None:
+            self._subfolder_inner.cancel()
 
     def pause(self) -> None:
         if self._pause_event.is_set():   # only act if currently running
@@ -1004,15 +1004,15 @@ class DataCollectorWorker(QThread):
             self._pause_event.set()
             self.resumed.emit()
 
-    def _run_archive_mode(self, subfolders: list[str]) -> None:
-        """Process *subfolders* one-by-one with a local ArchiveCheckpoint.
+    def _run_subfolder_mode(self, subfolders: list[str]) -> None:
+        """Process *subfolders* one-by-one with a local SubfolderCheckpoint.
 
         Each subfolder is a synchronous mini-run using a fresh DataCollectorWorker
-        with _leaf=True (no further subfolder detection).  The checkpoint is updated
-        after each successful subfolder so interrupted runs resume from where they
-        left off.
+        with _is_subfolder_run=True (no further subfolder detection). The checkpoint
+        is updated after each successful subfolder so interrupted runs resume from
+        where they left off.
         """
-        checkpoint = ArchiveCheckpoint.load_or_create(
+        checkpoint = SubfolderCheckpoint.load_or_create(
             container=self._container_name,
             source_prefix=self._source_prefix,
             filter_col=self._filter_col,
@@ -1024,7 +1024,7 @@ class DataCollectorWorker(QThread):
         n = len(subfolders)
         skipped = checkpoint.done_count
         self.log_message.emit(
-            f"[Archive] {n} Subfolder gefunden — "
+            f"{n} Subfolder gefunden — "
             f"{skipped} bereits erledigt, {n - skipped} ausstehend. "
             f"Checkpoint: {checkpoint.path.name}"
         )
@@ -1036,12 +1036,12 @@ class DataCollectorWorker(QThread):
 
             if checkpoint.is_done(subfolder):
                 self.log_message.emit(
-                    f"[Archive] Subfolder {idx + 1}/{n}: {subfolder} — übersprungen"
+                    f"Subfolder {idx + 1}/{n}: {subfolder} — übersprungen"
                 )
                 continue
 
             self.log_message.emit(
-                f"[Archive] Subfolder {idx + 1}/{n}: {subfolder} — wird verarbeitet …"
+                f"Subfolder {idx + 1}/{n}: {subfolder} — wird verarbeitet …"
             )
 
             subfolder_prefix = self._source_prefix.rstrip("/") + "/" + subfolder
@@ -1060,7 +1060,7 @@ class DataCollectorWorker(QThread):
                 selected_columns=self._selected_columns,
                 max_output_bytes=self._max_output_bytes,
                 start_part=checkpoint.next_part,
-                _leaf=True,
+                _is_subfolder_run=True,
             )
 
             # Capture result and cancellation synchronously.
@@ -1092,9 +1092,9 @@ class DataCollectorWorker(QThread):
             inner.paused.connect(self.paused, Qt.ConnectionType.DirectConnection)
             inner.resumed.connect(self.resumed, Qt.ConnectionType.DirectConnection)
 
-            self._archive_inner = inner
+            self._subfolder_inner = inner
             inner.run()   # synchronous — runs in this QThread's thread
-            self._archive_inner = None
+            self._subfolder_inner = None
 
             if _was_cancelled[0] or self._cancel_event.is_set():
                 self.cancelled.emit()
@@ -1106,16 +1106,16 @@ class DataCollectorWorker(QThread):
 
             if rows > 0:
                 self.log_message.emit(
-                    f"[Archive] Subfolder {subfolder} fertig: "
+                    f"Subfolder {subfolder} fertig: "
                     f"{rows:,} Zeilen, {parts_produced} Teil(e)"
                 )
             else:
                 self.log_message.emit(
-                    f"[Archive] Subfolder {subfolder} fertig: keine Treffer"
+                    f"Subfolder {subfolder} fertig: keine Treffer"
                 )
 
         self.log_message.emit(
-            f"[Archive] Alle {n} Subfolder verarbeitet — "
+            f"Alle {n} Subfolder verarbeitet — "
             f"{checkpoint.total_rows:,} Zeilen gesamt"
         )
         self.finished.emit({
@@ -1148,11 +1148,11 @@ class DataCollectorWorker(QThread):
 
         self._cancel_reason = None
 
-        # ── Subfolder detection (archive mode) ───────────────────────────────
+        # ── Subfolder detection ───────────────────────────────────────────────
         # When the source prefix contains virtual subdirectories, process them
         # one-by-one with a local checkpoint so interrupted runs can resume.
-        # _leaf=True suppresses this check for inner runs (prevents recursion).
-        if not self._leaf:
+        # _is_subfolder_run=True suppresses this check for inner runs (prevents recursion).
+        if not self._is_subfolder_run:
             try:
                 _probe_client = BlobStorageClient(self._conn, self._container_name)
                 try:
@@ -1163,7 +1163,7 @@ class DataCollectorWorker(QThread):
                 _subfolders = []
 
             if _subfolders:
-                self._run_archive_mode(_subfolders)
+                self._run_subfolder_mode(_subfolders)
                 return
         # ── End subfolder detection ───────────────────────────────────────────
 
@@ -1217,7 +1217,7 @@ class DataCollectorWorker(QThread):
             # Per-part metadata accumulator (reset after each flush).
             # The global meta_acc tracks totals for finished.emit.
             part_acc_ref: list = [MetadataAccumulator()]
-            # When start_part is provided (archive mode), start the counter one below
+            # When start_part is provided (subfolder mode), start the counter one below
             # so the first _flush_and_upload increment lands on start_part.
             part_counter = [self._start_part - 1 if self._start_part is not None else 0]
 
@@ -1234,7 +1234,7 @@ class DataCollectorWorker(QThread):
                 part_counter[0] += 1
                 # Use _part_NNN naming when:
                 #   (a) splitting is active (max_output_bytes > 0), OR
-                #   (b) called from archive mode (start_part set → global part numbering required)
+                #   (b) called from subfolder mode (start_part set → global part numbering required)
                 if self._max_output_bytes > 0 or self._start_part is not None:
                     out_name = make_output_blob_name(
                         self._output_prefix,

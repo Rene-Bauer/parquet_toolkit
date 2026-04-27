@@ -379,19 +379,19 @@ class CollectorRunRecord:
 
 
 # ---------------------------------------------------------------------------
-# ArchiveCheckpoint
+# SubfolderCheckpoint
 # ---------------------------------------------------------------------------
 
-_ARCHIVE_CHECKPOINT_DIR: Path = Path(__file__).parent.parent / "CollectorCheckpoint"
-"""Default directory for archive checkpoints: repo_root/CollectorCheckpoint/"""
+_SUBFOLDER_CHECKPOINT_DIR: Path = Path(__file__).parent.parent / "CollectorCheckpoint"
+"""Default directory for subfolder checkpoints: repo_root/CollectorCheckpoint/"""
 
 
-class ArchiveCheckpoint:
+class SubfolderCheckpoint:
     """
-    Per-run checkpoint for archive collection (subfolder-by-subfolder mode).
+    Per-run checkpoint for subfolder-by-subfolder collection mode.
 
     Stored in CollectorCheckpoint/ at the repository root (not in the user's
-    home directory — archive runs are machine-local and the folder is gitignored).
+    home directory — runs are machine-local and the folder is gitignored).
 
     Filename is derived deterministically from (container, source_prefix,
     filter_col, filter_values) so the same logical run always maps to the
@@ -425,7 +425,7 @@ class ArchiveCheckpoint:
         c  = re.sub(r"[^a-zA-Z0-9]", "_", container)
         p  = re.sub(r"[^a-zA-Z0-9]", "_", source_prefix)
         fc = re.sub(r"[^a-zA-Z0-9]", "_", filter_col)
-        return checkpoint_dir / f"{c}__{p}__{fc}__{digest}__archive.json"
+        return checkpoint_dir / f"{c}__{p}__{fc}__{digest}__subfolder.json"
 
     @staticmethod
     def load_or_create(
@@ -436,7 +436,7 @@ class ArchiveCheckpoint:
         output_prefix: str,
         output_container: str,
         _checkpoint_dir: Path | None = None,
-    ) -> "ArchiveCheckpoint":
+    ) -> "SubfolderCheckpoint":
         """Load an existing checkpoint or create a fresh one.
 
         *_checkpoint_dir* overrides the default storage location and is
@@ -444,8 +444,8 @@ class ArchiveCheckpoint:
 
         Raises RuntimeError if the checkpoint file exists but is corrupt.
         """
-        directory = _checkpoint_dir or _ARCHIVE_CHECKPOINT_DIR
-        path = ArchiveCheckpoint._make_path(
+        directory = _checkpoint_dir or _SUBFOLDER_CHECKPOINT_DIR
+        path = SubfolderCheckpoint._make_path(
             container, source_prefix, filter_col, filter_values, directory
         )
         if path.exists():
@@ -454,7 +454,7 @@ class ArchiveCheckpoint:
                     data = json.load(f)
                 except json.JSONDecodeError as exc:
                     raise RuntimeError(
-                        f"Archive checkpoint is corrupt and cannot be loaded: {path}\n"
+                        f"Subfolder checkpoint is corrupt and cannot be loaded: {path}\n"
                         f"Delete the file to start fresh. Detail: {exc}"
                     ) from exc
         else:
@@ -471,7 +471,7 @@ class ArchiveCheckpoint:
                 "created_at": _now(),
                 "updated_at": _now(),
             }
-        return ArchiveCheckpoint(path, data)
+        return SubfolderCheckpoint(path, data)
 
     # ------------------------------------------------------------------
     # Queries

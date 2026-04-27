@@ -477,7 +477,7 @@ def test_writer_no_splitting_when_max_output_bytes_zero():
     assert results["outputBlobs"] == upload_calls
 
 
-# --- start_part / _leaf ---
+# --- start_part / _is_subfolder_run ---
 
 def test_start_part_stored_on_init():
     worker = _make_worker(start_part=5)
@@ -489,9 +489,9 @@ def test_start_part_defaults_to_none():
     assert worker._start_part is None
 
 
-def test_leaf_flag_defaults_to_false():
+def test_is_subfolder_run_defaults_to_false():
     worker = _make_worker()
-    assert worker._leaf is False
+    assert worker._is_subfolder_run is False
 
 
 def test_start_part_produces_part_numbered_output(monkeypatch):
@@ -518,9 +518,9 @@ def test_start_part_produces_part_numbered_output(monkeypatch):
     assert "_part_003" in upload_calls[0]
 
 
-# --- archive mode ---
+# --- subfolder mode ---
 
-def test_archive_mode_skips_completed_subfolder():
+def test_subfolder_mode_skips_completed_subfolder():
     """When checkpoint marks subfolder as done, no blobs are downloaded for it."""
     from unittest.mock import MagicMock, patch
 
@@ -532,7 +532,7 @@ def test_archive_mode_skips_completed_subfolder():
         return raw
 
     with patch("gui.workers.BlobStorageClient") as MockClient, \
-         patch("parquet_transform.checkpoint.ArchiveCheckpoint.load_or_create") as mock_cp_ctor:
+         patch("parquet_transform.checkpoint.SubfolderCheckpoint.load_or_create") as mock_cp_ctor:
 
         mock_cp = MagicMock()
         mock_cp.next_part = 2
@@ -558,7 +558,7 @@ def test_archive_mode_skips_completed_subfolder():
     assert "26-03-2026" in download_calls[0]
 
 
-def test_archive_mode_emits_finished_with_total_rows():
+def test_subfolder_mode_emits_finished_with_total_rows():
     """finished signal carries total rows from checkpoint after all subfolders."""
     from unittest.mock import MagicMock, patch
 
@@ -566,7 +566,7 @@ def test_archive_mode_emits_finished_with_total_rows():
     finished_results = []
 
     with patch("gui.workers.BlobStorageClient") as MockClient, \
-         patch("parquet_transform.checkpoint.ArchiveCheckpoint.load_or_create") as mock_cp_ctor:
+         patch("parquet_transform.checkpoint.SubfolderCheckpoint.load_or_create") as mock_cp_ctor:
 
         mock_cp = MagicMock()
         mock_cp.next_part = 1

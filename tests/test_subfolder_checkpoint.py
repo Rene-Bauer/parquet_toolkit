@@ -1,12 +1,12 @@
-# tests/test_archive_checkpoint.py
+# tests/test_subfolder_checkpoint.py
 import pytest
 from pathlib import Path
-from parquet_transform.checkpoint import ArchiveCheckpoint
+from parquet_transform.checkpoint import SubfolderCheckpoint
 
 
-def _cp(tmp_path: Path) -> ArchiveCheckpoint:
+def _cp(tmp_path: Path) -> SubfolderCheckpoint:
     """Helper: fresh checkpoint in tmp_path."""
-    return ArchiveCheckpoint.load_or_create(
+    return SubfolderCheckpoint.load_or_create(
         container="mycontainer",
         source_prefix="archive/",
         filter_col="SenderUid",
@@ -98,12 +98,12 @@ def test_checkpoint_filename_is_deterministic(tmp_path):
 
 
 def test_different_filter_values_produce_different_files(tmp_path):
-    cp_a = ArchiveCheckpoint.load_or_create(
+    cp_a = SubfolderCheckpoint.load_or_create(
         container="c", source_prefix="p/", filter_col="SenderUid",
         filter_values=["uid1"], output_prefix="out/", output_container="c",
         _checkpoint_dir=tmp_path,
     )
-    cp_b = ArchiveCheckpoint.load_or_create(
+    cp_b = SubfolderCheckpoint.load_or_create(
         container="c", source_prefix="p/", filter_col="SenderUid",
         filter_values=["uid999"], output_prefix="out/", output_container="c",
         _checkpoint_dir=tmp_path,
@@ -112,12 +112,12 @@ def test_different_filter_values_produce_different_files(tmp_path):
 
 
 def test_different_filter_cols_produce_different_files(tmp_path):
-    cp_a = ArchiveCheckpoint.load_or_create(
+    cp_a = SubfolderCheckpoint.load_or_create(
         container="c", source_prefix="p/", filter_col="SenderUid",
         filter_values=["uid1"], output_prefix="out/", output_container="c",
         _checkpoint_dir=tmp_path,
     )
-    cp_b = ArchiveCheckpoint.load_or_create(
+    cp_b = SubfolderCheckpoint.load_or_create(
         container="c", source_prefix="p/", filter_col="DeviceUid",
         filter_values=["uid1"], output_prefix="out/", output_container="c",
         _checkpoint_dir=tmp_path,
