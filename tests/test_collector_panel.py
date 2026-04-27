@@ -431,3 +431,26 @@ def test_no_subfolder_checkpoint_uses_run_record_flow(tmp_path):
         panel._on_collect()
 
     mock_rr_ctor.assert_called_once()
+
+
+def test_corrupt_subfolder_checkpoint_falls_through_to_run_record(tmp_path):
+    """A corrupt SubfolderCheckpoint is non-fatal; the run-record flow still runs."""
+    from parquet_transform.checkpoint import SubfolderCheckpoint
+
+    panel = CollectorPanel()
+    _fill_panel(panel)
+
+    fake_cp_path = tmp_path / "fake__subfolder.json"
+    fake_cp_path.write_text("not json", encoding="utf-8")
+
+    mock_rr = MagicMock()
+    mock_rr.is_complete.return_value = False
+    mock_rr.status = "none"
+
+    with patch.object(SubfolderCheckpoint, "checkpoint_path", return_value=fake_cp_path), \
+         patch("gui.collector_panel.CollectorRunRecord.load_or_create", return_value=mock_rr) as mock_rr_ctor, \
+         patch("gui.workers.DataCollectorWorker.start"):
+
+        panel._on_collect()
+
+    mock_rr_ctor.assert_called_once()

@@ -324,9 +324,8 @@ class CollectorPanel(QWidget):
         if _cp_path.exists():
             try:
                 _cp = SubfolderCheckpoint.load_existing(_cp_path)
-            except RuntimeError as exc:
-                self._log_error(f"Corrupt subfolder checkpoint (delete to reset): {exc}")
-                return
+            except RuntimeError:
+                _cp = None  # corrupt — fall through to existing flow
             if _cp is not None and (_cp.done_count > 0 or _cp.in_progress_subfolder):
                 from PyQt6.QtWidgets import QMessageBox
                 msg = QMessageBox(self)
