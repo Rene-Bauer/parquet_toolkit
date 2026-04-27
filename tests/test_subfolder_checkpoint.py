@@ -196,3 +196,9 @@ def test_mark_in_progress_overwrites_previous(tmp_path):
     cp.mark_in_progress("26-02-2026")
     cp.mark_in_progress("26-03-2026")
     assert cp.in_progress_subfolder == "26-03-2026"
+
+
+def test_mark_in_progress_rejects_empty_subfolder(tmp_path):
+    cp = _cp(tmp_path)
+    with pytest.raises(ValueError, match="non-empty"):
+        cp.mark_in_progress("")
