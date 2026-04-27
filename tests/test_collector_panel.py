@@ -359,7 +359,7 @@ def test_resume_keeps_subfolder_checkpoint(tmp_path):
     mock_rr.status = "none"
 
     with patch.object(SubfolderCheckpoint, "checkpoint_path", return_value=fake_cp_path), \
-         patch("gui.collector_panel.CollectorRunRecord.load_or_create", return_value=mock_rr), \
+         patch("gui.collector_panel.CollectorRunRecord.load_or_create", return_value=mock_rr) as mock_rr_ctor, \
          patch("gui.workers.DataCollectorWorker.start"), \
          patch("PyQt6.QtWidgets.QMessageBox") as MockMB:
 
@@ -378,6 +378,7 @@ def test_resume_keeps_subfolder_checkpoint(tmp_path):
         panel._on_collect()
 
     assert fake_cp_path.exists()
+    mock_rr_ctor.assert_called_once()  # collection proceeded past the dialog
 
 
 def test_cancel_subfolder_dialog_aborts_collection(tmp_path):
