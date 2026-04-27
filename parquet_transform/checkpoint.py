@@ -447,7 +447,7 @@ class SubfolderCheckpoint:
 
     @staticmethod
     def load_existing(path: Path) -> "SubfolderCheckpoint | None":
-        """Load a checkpoint from *path* for read-only inspection.
+        """Load a checkpoint from *path* without creating it if absent.
 
         Returns None if *path* does not exist.
         Raises RuntimeError if the file is corrupt (unparseable JSON).
@@ -552,6 +552,8 @@ class SubfolderCheckpoint:
         Called just before starting an inner run. Allows the panel to show
         which subfolder was interrupted if the run is cancelled.
         """
+        if not subfolder:
+            raise ValueError("subfolder must be a non-empty string")
         with self._lock:
             self._data["in_progress_subfolder"] = subfolder
             self._data["updated_at"] = _now()
