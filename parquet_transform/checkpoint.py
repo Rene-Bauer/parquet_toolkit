@@ -428,6 +428,43 @@ class SubfolderCheckpoint:
         return checkpoint_dir / f"{c}__{p}__{fc}__{digest}__subfolder.json"
 
     @staticmethod
+    def checkpoint_path(
+        container: str,
+        source_prefix: str,
+        filter_col: str,
+        filter_values: list[str],
+        _checkpoint_dir: Path | None = None,
+    ) -> Path:
+        """Return the checkpoint file path for the given run key.
+
+        Does not create the file. Safe to call before load_or_create.
+        *_checkpoint_dir* overrides the default storage location (tests only).
+        """
+        directory = _checkpoint_dir or _SUBFOLDER_CHECKPOINT_DIR
+        return SubfolderCheckpoint._make_path(
+            container, source_prefix, filter_col, filter_values, directory
+        )
+
+    @staticmethod
+    def load_existing(path: Path) -> "SubfolderCheckpoint | None":
+        """Load a checkpoint from *path* for read-only inspection.
+
+        Returns None if *path* does not exist.
+        Raises RuntimeError if the file is corrupt (unparseable JSON).
+        """
+        if not path.exists():
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"Subfolder checkpoint is corrupt and cannot be loaded: {path}\n"
+                    f"Delete the file to start fresh. Detail: {exc}"
+                ) from exc
+        return SubfolderCheckpoint(path, data)
+
+    @staticmethod
     def load_or_create(
         container: str,
         source_prefix: str,
@@ -497,12 +534,28 @@ class SubfolderCheckpoint:
         return len(self._data.get("subfolders_done", []))
 
     @property
+    def in_progress_subfolder(self) -> str | None:
+        """The subfolder currently being processed, or None if no run is active."""
+        return self._data.get("in_progress_subfolder")
+
+    @property
     def path(self) -> Path:
         return self._path
 
     # ------------------------------------------------------------------
     # Mutations
     # ------------------------------------------------------------------
+
+    def mark_in_progress(self, subfolder: str) -> None:
+        """Record *subfolder* as the one currently being processed.
+
+        Called just before starting an inner run. Allows the panel to show
+        which subfolder was interrupted if the run is cancelled.
+        """
+        with self._lock:
+            self._data["in_progress_subfolder"] = subfolder
+            self._data["updated_at"] = _now()
+            self._write()
 
     def mark_done(self, subfolder: str, parts_produced: int, rows: int) -> None:
         """Record *subfolder* as complete and persist atomically.
@@ -521,6 +574,7 @@ class SubfolderCheckpoint:
             done.append(subfolder)
             self._data["next_part"] = self._data.get("next_part", 1) + parts_produced
             self._data["total_rows"] = self._data.get("total_rows", 0) + rows
+            self._data["in_progress_subfolder"] = None
             self._data["updated_at"] = _now()
             self._write()
 

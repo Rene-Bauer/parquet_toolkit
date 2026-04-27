@@ -123,3 +123,76 @@ def test_different_filter_cols_produce_different_files(tmp_path):
         _checkpoint_dir=tmp_path,
     )
     assert cp_a.path != cp_b.path
+
+
+# --- checkpoint_path / load_existing ---
+
+def test_checkpoint_path_matches_load_or_create_path(tmp_path):
+    cp = _cp(tmp_path)
+    expected = SubfolderCheckpoint.checkpoint_path(
+        "mycontainer", "archive/", "SenderUid", ["uid1", "uid2"],
+        _checkpoint_dir=tmp_path,
+    )
+    assert cp.path == expected
+
+
+def test_load_existing_returns_none_for_missing_file(tmp_path):
+    result = SubfolderCheckpoint.load_existing(tmp_path / "nonexistent.json")
+    assert result is None
+
+
+def test_load_existing_loads_saved_checkpoint(tmp_path):
+    cp = _cp(tmp_path)
+    cp.mark_done("26-02-2026", parts_produced=1, rows=500)
+
+    loaded = SubfolderCheckpoint.load_existing(cp.path)
+    assert loaded is not None
+    assert loaded.done_count == 1
+    assert loaded.total_rows == 500
+
+
+def test_load_existing_raises_on_corrupt_file(tmp_path):
+    cp = _cp(tmp_path)
+    cp.mark_done("26-02-2026", parts_produced=1, rows=100)
+    cp.path.write_text("not json", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="corrupt"):
+        SubfolderCheckpoint.load_existing(cp.path)
+
+
+# --- mark_in_progress / in_progress_subfolder ---
+
+def test_in_progress_subfolder_defaults_to_none(tmp_path):
+    cp = _cp(tmp_path)
+    assert cp.in_progress_subfolder is None
+
+
+def test_mark_in_progress_sets_subfolder(tmp_path):
+    cp = _cp(tmp_path)
+    cp.mark_in_progress("26-03-2026")
+    assert cp.in_progress_subfolder == "26-03-2026"
+
+
+def test_mark_in_progress_persists_across_loads(tmp_path):
+    cp = _cp(tmp_path)
+    cp.mark_done("26-02-2026", parts_produced=1, rows=500)
+    cp.mark_in_progress("26-03-2026")
+
+    cp2 = _cp(tmp_path)
+    assert cp2.in_progress_subfolder == "26-03-2026"
+
+
+def test_mark_done_clears_in_progress_subfolder(tmp_path):
+    cp = _cp(tmp_path)
+    cp.mark_in_progress("26-03-2026")
+    assert cp.in_progress_subfolder == "26-03-2026"
+
+    cp.mark_done("26-03-2026", parts_produced=1, rows=300)
+    assert cp.in_progress_subfolder is None
+
+
+def test_mark_in_progress_overwrites_previous(tmp_path):
+    cp = _cp(tmp_path)
+    cp.mark_in_progress("26-02-2026")
+    cp.mark_in_progress("26-03-2026")
+    assert cp.in_progress_subfolder == "26-03-2026"
