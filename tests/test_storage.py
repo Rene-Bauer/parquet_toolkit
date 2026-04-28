@@ -265,3 +265,51 @@ def test_read_parquet_footer_raises_when_blob_too_small():
 
     with pytest.raises(RuntimeError, match="too small"):
         client.read_parquet_footer("tiny.parquet")
+
+
+# ---------------------------------------------------------------------------
+# list_first_parquet_blob
+# ---------------------------------------------------------------------------
+
+def test_list_first_parquet_blob_returns_first_match():
+    from unittest.mock import MagicMock
+
+    b1 = MagicMock(); b1.name = "data/file_a.parquet"
+    b2 = MagicMock(); b2.name = "data/file_b.parquet"
+
+    mock_container = MagicMock()
+    mock_container.list_blobs.return_value = iter([b1, b2])
+
+    client = BlobStorageClient.__new__(BlobStorageClient)
+    client._container = mock_container
+
+    result = client.list_first_parquet_blob("data/")
+
+    assert result == "data/file_a.parquet"
+
+
+def test_list_first_parquet_blob_skips_non_parquet():
+    from unittest.mock import MagicMock
+
+    b_txt = MagicMock(); b_txt.name = "data/readme.txt"
+    b_pq  = MagicMock(); b_pq.name  = "data/first.parquet"
+
+    mock_container = MagicMock()
+    mock_container.list_blobs.return_value = iter([b_txt, b_pq])
+
+    client = BlobStorageClient.__new__(BlobStorageClient)
+    client._container = mock_container
+
+    assert client.list_first_parquet_blob("data/") == "data/first.parquet"
+
+
+def test_list_first_parquet_blob_returns_none_when_empty():
+    from unittest.mock import MagicMock
+
+    mock_container = MagicMock()
+    mock_container.list_blobs.return_value = iter([])
+
+    client = BlobStorageClient.__new__(BlobStorageClient)
+    client._container = mock_container
+
+    assert client.list_first_parquet_blob("empty/") is None

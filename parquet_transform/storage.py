@@ -61,6 +61,17 @@ class BlobStorageClient:
     # Listing
     # ------------------------------------------------------------------
 
+    def list_first_parquet_blob(self, prefix: str) -> str | None:
+        """Return the name of the first .parquet blob under *prefix*, or None if empty.
+
+        Stops iteration after finding the first match, so it completes after
+        a single API round-trip regardless of how many blobs exist.
+        """
+        for b in self._container.list_blobs(name_starts_with=prefix):
+            if b.name.endswith(".parquet"):
+                return b.name
+        return None
+
     def list_blobs(self, prefix: str) -> list[str]:
         """
         Return all blob names under *prefix* that end with '.parquet'.

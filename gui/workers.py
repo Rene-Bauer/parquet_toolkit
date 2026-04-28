@@ -6,6 +6,7 @@ Workers communicate back to the main thread via Qt signals.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import io
 import queue
 import threading
@@ -287,22 +288,41 @@ class SchemaLoaderWorker(QThread):
         self._prefix = prefix
 
     def run(self) -> None:
+        c_list = c_schema = None
         try:
-            client = BlobStorageClient(self._connection_string, self._container)
-            blobs = client.list_blobs_with_sizes(self._prefix)
-            client.close()
+            c_list = BlobStorageClient(self._connection_string, self._container)
+            c_schema = BlobStorageClient(self._connection_string, self._container)
+
+            def _fetch_schema() -> pa.Schema:
+                first = c_schema.list_first_parquet_blob(self._prefix)
+                if first is None:
+                    raise RuntimeError(
+                        f"No .parquet files found under prefix '{self._prefix}'."
+                    )
+                return c_schema.read_schema(first)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                fut_blobs = pool.submit(c_list.list_blobs_with_sizes, self._prefix)
+                fut_schema = pool.submit(_fetch_schema)
+
+            blobs = fut_blobs.result()
+            schema = fut_schema.result()
+
             if not blobs:
                 self.error.emit(f"No .parquet files found under prefix '{self._prefix}'.")
                 return
-            blob_names = [name for name, _ in blobs]
+
             known   = [(n, s) for n, s in blobs if s >= 0]
             unknown = [n      for n, s in blobs if s <  0]
             total_bytes = sum(s for _, s in known)
-            schema = client.read_schema(blob_names[0])
             self.schema_loaded.emit(schema, len(blobs), total_bytes, unknown)
         except Exception as exc:
             short_error, _, _ = _summarize_exception(exc)
             self.error.emit(short_error)
+        finally:
+            for _c in (c_list, c_schema):
+                if _c is not None:
+                    _c.close()
 
 
 class TransformWorker(QThread):
