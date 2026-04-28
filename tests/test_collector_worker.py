@@ -56,6 +56,31 @@ def _run_worker(worker):
     return results
 
 
+def _configure_verify_passthrough(mock_client) -> None:
+    """Wrap mock_client so upload verification always passes.
+
+    Captures the Parquet file at upload_stream time (file still exists),
+    stores its metadata, and returns it from read_parquet_footer.
+    Chains any pre-existing upload_stream side_effect unchanged.
+    """
+    uploaded_meta: dict = {}
+    original_se = mock_client.upload_stream.side_effect
+
+    def _capturing_upload(blob_name, file_path, **kwargs):
+        try:
+            meta = pq.read_metadata(file_path)
+            uploaded_meta[blob_name] = (meta.num_rows, meta.schema.to_arrow_schema())
+        except Exception:
+            pass
+        if callable(original_se) and not isinstance(original_se, MagicMock):
+            return original_se(blob_name, file_path, **kwargs)
+
+    mock_client.upload_stream.side_effect = _capturing_upload
+    mock_client.read_parquet_footer.side_effect = (
+        lambda blob: uploaded_meta.get(blob, (0, pa.schema([])))
+    )
+
+
 def _make_worker(**kwargs):
     from gui.workers import DataCollectorWorker
     defaults = dict(
@@ -83,6 +108,7 @@ def test_worker_combines_rows_from_multiple_blobs():
         _make_parquet_bytes("uid1", "dev1", 2),
         _make_parquet_bytes("uid1", "dev1", 3),
     )
+    _configure_verify_passthrough(mock_client)
 
     with patch("gui.workers.BlobStorageClient", return_value=mock_client):
         results = _run_worker(_make_worker())
@@ -116,6 +142,7 @@ def test_worker_filters_only_matching_rows():
     mock_client.list_blobs.return_value = ["p/f1.parquet"]
     mock_client.list_blob_prefixes.return_value = []
     mock_client.download_bytes.return_value = buf.getvalue()
+    _configure_verify_passthrough(mock_client)
 
     with patch("gui.workers.BlobStorageClient", return_value=mock_client):
         results = _run_worker(_make_worker())
@@ -170,6 +197,7 @@ def test_worker_emits_file_error_on_bad_blob_and_continues():
     mock_client.list_blobs.return_value = ["p/bad.parquet", "p/good.parquet"]
     mock_client.list_blob_prefixes.return_value = []
     mock_client.download_bytes.side_effect = _side_effect
+    _configure_verify_passthrough(mock_client)
 
     errors = []
     with patch("gui.workers.BlobStorageClient", return_value=mock_client):
@@ -201,6 +229,7 @@ def test_worker_output_has_correct_metadata():
         captured_tables.append(_pq.read_table(file_path))
 
     mock_client.upload_stream.side_effect = _capture_upload
+    _configure_verify_passthrough(mock_client)
 
     with patch("gui.workers.BlobStorageClient", return_value=mock_client):
         results = _run_worker(_make_worker())
@@ -222,6 +251,7 @@ def test_worker_uses_separate_output_container():
     source_mock.download_bytes.return_value = _make_parquet_bytes("uid1", "dev1", 2)
 
     output_mock = MagicMock()
+    _configure_verify_passthrough(output_mock)
 
     def _client_factory(conn, container):
         if container == "source-container":
@@ -386,6 +416,7 @@ def test_predicate_pushdown_calls_read_table_with_filters():
     mock_client.list_blobs.return_value = ["p/f1.parquet"]
     mock_client.list_blob_prefixes.return_value = []
     mock_client.download_bytes.return_value = _make_parquet_bytes("uid1", "dev1", 2)
+    _configure_verify_passthrough(mock_client)
 
     read_table_calls = []
     _orig_read_table = pq.read_table
@@ -436,6 +467,7 @@ def test_writer_splits_output_when_max_output_bytes_exceeded():
         upload_calls.append(blob_name)
 
     mock_client.upload_stream.side_effect = _capture_upload
+    _configure_verify_passthrough(mock_client)
 
     with patch("gui.workers.BlobStorageClient", return_value=mock_client):
         # max_output_bytes=1 forces a flush after every write
@@ -466,6 +498,7 @@ def test_writer_no_splitting_when_max_output_bytes_zero():
     def _capture(blob_name, file_path, **kwargs):
         upload_calls.append(blob_name)
     mock_client.upload_stream.side_effect = _capture
+    _configure_verify_passthrough(mock_client)
 
     with patch("gui.workers.BlobStorageClient", return_value=mock_client):
         results = _run_worker(_make_worker())
@@ -510,6 +543,7 @@ def test_start_part_produces_part_numbered_output(monkeypatch):
         mock_instance.download_bytes.return_value = raw
         mock_instance.upload_stream.side_effect = fake_upload_stream
         mock_instance.list_blob_prefixes.return_value = []  # no subfolders (forward-compat)
+        _configure_verify_passthrough(mock_instance)
 
         worker = _make_worker(start_part=3, max_output_bytes=0)
         worker.run()
@@ -638,3 +672,85 @@ def test_subfolder_mode_calls_mark_in_progress_before_inner_run():
     assert mock_cp.mark_in_progress.call_count == 2
     mock_cp.mark_in_progress.assert_any_call("26-02-2026")
     mock_cp.mark_in_progress.assert_any_call("26-03-2026")
+
+
+# ---------------------------------------------------------------------------
+# upload verify helpers
+# ---------------------------------------------------------------------------
+
+def _make_storage_client_mock_for_verify(parquet_bytes: bytes):
+    """Return a mock BlobStorageClient that verifies against the given parquet_bytes."""
+    import io
+    import pyarrow.parquet as pq
+
+    meta = pq.read_metadata(io.BytesIO(parquet_bytes))
+    actual_rows = meta.num_rows
+    actual_schema = meta.schema.to_arrow_schema()
+
+    mock = MagicMock()
+    mock.read_parquet_footer.return_value = (actual_rows, actual_schema)
+    return mock
+
+
+def test_upload_verify_success_no_retry():
+    """On matching row count + schema, upload succeeds in one attempt."""
+    from gui.workers import _upload_verify_with_retry
+
+    table = pa.table({"x": pa.array([1, 2, 3], type=pa.int32())})
+    buf = io.BytesIO()
+    pq.write_table(table, buf)
+    parquet_bytes = buf.getvalue()
+
+    client = _make_storage_client_mock_for_verify(parquet_bytes)
+
+    _upload_verify_with_retry(client, "out/result.parquet", "/fake/path.parquet", 3, table.schema)
+
+    assert client.upload_stream.call_count == 1
+    assert client.delete_blob.call_count == 0
+
+
+def test_upload_verify_row_count_mismatch_retries_then_succeeds():
+    """First verify returns wrong row count → delete + retry → second verify ok."""
+    from gui.workers import _upload_verify_with_retry
+
+    schema = pa.schema([("x", pa.int32())])
+    client = MagicMock()
+    client.read_parquet_footer.side_effect = [
+        (99, schema),   # mismatch
+        (3, schema),    # correct after retry
+    ]
+
+    _upload_verify_with_retry(client, "out/result.parquet", "/fake/path.parquet", 3, schema)
+
+    assert client.upload_stream.call_count == 2
+    assert client.delete_blob.call_count == 1
+
+
+def test_upload_verify_both_attempts_fail_raises():
+    """Two consecutive row-count mismatches → RuntimeError, blob cleaned up twice."""
+    from gui.workers import _upload_verify_with_retry
+
+    schema = pa.schema([("x", pa.int32())])
+    client = MagicMock()
+    client.read_parquet_footer.return_value = (99, schema)  # always wrong
+
+    with pytest.raises(RuntimeError, match="verification failed"):
+        _upload_verify_with_retry(client, "out/result.parquet", "/fake/path.parquet", 3, schema)
+
+    assert client.upload_stream.call_count == 2
+    assert client.delete_blob.call_count == 2
+
+
+def test_upload_failure_triggers_delete_then_retry_succeeds():
+    """Upload raises on first attempt → delete → retry succeeds → no further delete."""
+    from gui.workers import _upload_verify_with_retry
+
+    schema = pa.schema([("x", pa.int32())])
+    client = MagicMock()
+    client.upload_stream.side_effect = [OSError("network error"), None]
+    client.read_parquet_footer.return_value = (3, schema)
+
+    _upload_verify_with_retry(client, "out/result.parquet", "/fake/path.parquet", 3, schema)
+
+    assert client.upload_stream.call_count == 2
+    assert client.delete_blob.call_count == 1

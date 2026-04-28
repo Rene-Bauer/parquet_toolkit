@@ -200,6 +200,82 @@ def _summarize_exception(exc: BaseException) -> tuple[str, bool, bool]:
     return (f"{exc.__class__.__name__}: {message}", False, False)
 
 
+def _try_delete_blob(client: "BlobStorageClient", blob_name: str) -> None:
+    """Delete blob silently — used for best-effort cleanup after upload failure."""
+    try:
+        client.delete_blob(blob_name)
+    except Exception:
+        pass
+
+
+def _attempt_upload_verify(
+    client: "BlobStorageClient",
+    blob_name: str,
+    file_path: str,
+    expected_rows: int,
+    expected_schema: pa.Schema,
+    timeout: int,
+) -> Exception | None:
+    """Single upload + verify cycle. Returns None on success, Exception on any failure.
+
+    Cleans up the blob (best-effort delete) before returning a failure so the
+    caller can retry with a clean slate.
+    """
+    try:
+        client.upload_stream(blob_name, file_path, timeout=timeout)
+    except Exception as exc:
+        _try_delete_blob(client, blob_name)
+        return exc
+
+    try:
+        actual_rows, actual_schema = client.read_parquet_footer(blob_name)
+    except Exception as exc:
+        _try_delete_blob(client, blob_name)
+        return exc
+
+    if actual_rows != expected_rows:
+        _try_delete_blob(client, blob_name)
+        return RuntimeError(
+            f"Upload verification failed for {blob_name!r}: "
+            f"expected {expected_rows} rows, got {actual_rows}"
+        )
+
+    if not actual_schema.equals(expected_schema, check_metadata=False):
+        _try_delete_blob(client, blob_name)
+        return RuntimeError(
+            f"Upload verification failed for {blob_name!r}: schema mismatch — "
+            f"expected {expected_schema}, got {actual_schema}"
+        )
+
+    return None
+
+
+def _upload_verify_with_retry(
+    client: "BlobStorageClient",
+    blob_name: str,
+    file_path: str,
+    expected_rows: int,
+    expected_schema: pa.Schema,
+    timeout: int = UPLOAD_TIMEOUT_S,
+) -> None:
+    """Upload file_path to blob_name and verify row count + schema.
+
+    Retries once on any failure (upload error or verification mismatch).
+    Deletes the blob before each retry so the next attempt starts clean.
+    Raises RuntimeError if both attempts fail.
+    """
+    last_exc: Exception | None = None
+    for _ in range(2):
+        last_exc = _attempt_upload_verify(
+            client, blob_name, file_path, expected_rows, expected_schema, timeout
+        )
+        if last_exc is None:
+            return
+    raise RuntimeError(
+        f"Upload of {blob_name!r} failed after 2 attempts: {last_exc}"
+    ) from last_exc
+
+
 class SchemaLoaderWorker(QThread):
     schema_loaded = pyqtSignal(object, int, object, object)
     error = pyqtSignal(str)
@@ -1255,9 +1331,12 @@ class DataCollectorWorker(QThread):
                 os.close(rw_fd)
                 try:
                     rewrite_with_metadata(current_tmp, rw_tmp, final_meta)
-                    output_client.upload_stream(
-                        out_name, rw_tmp,
-                        timeout=UPLOAD_TIMEOUT_S,
+                    _upload_verify_with_retry(
+                        output_client,
+                        out_name,
+                        rw_tmp,
+                        expected_rows=part_acc_ref[0].total_rows,
+                        expected_schema=writer_schema[0],
                     )
                     part_names.append(out_name)
                 finally:
