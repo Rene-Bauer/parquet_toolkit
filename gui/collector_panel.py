@@ -8,6 +8,7 @@ from time import perf_counter
 from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QGroupBox,
@@ -18,6 +19,8 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSpinBox,
+    QStyle,
+    QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -50,6 +53,7 @@ class CollectorPanel(QWidget):
         self._worker_cleanup_timer: QTimer | None = None
         self._log_stream: "IO[str] | None" = None
         self._log_file_path: str | None = None
+        self._tray_icon: QSystemTrayIcon | None = None
         self._schema_worker: SchemaLoaderWorker | None = None
 
         root = QVBoxLayout(self)
@@ -453,7 +457,7 @@ class CollectorPanel(QWidget):
         self._pause_btn.setText("Pause")
         self._is_paused = False
         self._run_start_time = perf_counter()
-        self._eta_label.setText("")
+        self._eta_label.setText("Listing blobs…")
         self._progress.setValue(0)
         self._progress.setVisible(True)
         col_note = (
@@ -514,6 +518,7 @@ class CollectorPanel(QWidget):
 
     def _on_listing_complete(self, total: int) -> None:
         self._progress.setMaximum(total)
+        self._eta_label.setText("")
         self._log_info(f"Found {total} Parquet blobs to scan.")
 
     def _on_progress(self, completed: int, total: int, blob_name: str, matched_rows: int) -> None:
@@ -550,7 +555,8 @@ class CollectorPanel(QWidget):
         self._pause_btn.setEnabled(False)
         self._pause_btn.setText("Pause")
         self._is_paused = False
-        self._eta_label.setText("")
+        elapsed = perf_counter() - self._run_start_time
+        self._eta_label.setText(f"Elapsed: {_format_duration(elapsed)}")
         self._progress.setVisible(False)
         row_count = result.get("rowCount", 0)
         out_blobs = result.get("outputBlobs", [])
@@ -572,14 +578,26 @@ class CollectorPanel(QWidget):
             self._log_info(
                 f"Collection complete: {row_count} rows (no output blobs reported)"
             )
+            self._show_notification(
+                "Collection complete",
+                f"{row_count} rows collected",
+            )
         elif len(out_blobs) == 1:
             self._log_info(
                 f"Collection complete: {row_count} rows → [{out_container}] {out_blobs[0]}"
+            )
+            self._show_notification(
+                "Collection complete",
+                f"{row_count} rows → {out_blobs[0]}",
             )
         else:
             self._log_info(
                 f"Collection complete: {row_count} rows → [{out_container}] "
                 f"{len(out_blobs)} part(s): {', '.join(out_blobs)}"
+            )
+            self._show_notification(
+                "Collection complete",
+                f"{row_count} rows → {len(out_blobs)} part(s)",
             )
         self._resources_panel.clear_worker_throughput()
         self._close_log_stream()
@@ -591,7 +609,8 @@ class CollectorPanel(QWidget):
         self._pause_btn.setEnabled(False)
         self._pause_btn.setText("Pause")
         self._is_paused = False
-        self._eta_label.setText("")
+        elapsed = perf_counter() - self._run_start_time
+        self._eta_label.setText(f"Elapsed: {_format_duration(elapsed)}")
         self._progress.setVisible(False)
         self._log_info("Collection cancelled.")
         self._run_record = None
@@ -643,6 +662,18 @@ class CollectorPanel(QWidget):
     # ------------------------------------------------------------------
     # Logging helpers
     # ------------------------------------------------------------------
+
+    def _show_notification(self, title: str, body: str) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        if self._tray_icon is None:
+            self._tray_icon = QSystemTrayIcon(self)
+            icon = QApplication.instance().windowIcon()
+            if icon.isNull():
+                icon = self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation)
+            self._tray_icon.setIcon(icon)
+            self._tray_icon.show()
+        self._tray_icon.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, 5000)
 
     def _log_info(self, text: str) -> None:
         self._append_log(text, color=None)

@@ -122,18 +122,76 @@ def test_eta_label_exists_and_initially_empty():
     assert panel._eta_label.text() == ""
 
 
-def test_eta_label_clears_on_finished():
+def test_eta_label_shows_elapsed_on_finished():
     panel = CollectorPanel()
     panel._eta_label.setText("ETA 1m 30s (~14:00)")
     panel._on_finished({"rowCount": 0})
-    assert panel._eta_label.text() == ""
+    assert panel._eta_label.text().startswith("Elapsed:")
 
 
-def test_eta_label_clears_on_cancelled():
+def test_eta_label_shows_elapsed_on_cancelled():
     panel = CollectorPanel()
     panel._eta_label.setText("ETA 1m 30s (~14:00)")
     panel._on_cancelled()
+    assert panel._eta_label.text().startswith("Elapsed:")
+
+
+def test_eta_label_shows_listing_blobs_during_collect(monkeypatch):
+    """ETA label must show 'Listing blobs…' while waiting for listing to complete."""
+    from unittest.mock import MagicMock, patch
+
+    panel = CollectorPanel()
+    panel._conn_edit.setText("conn")
+    panel._container_edit.setText("cont")
+    panel._source_edit.setText("pfx/")
+    panel._output_edit.setText("out/")
+    panel._ids_edit.setPlainText("uid1")
+
+    mock_worker = MagicMock()
+    for sig in ("listing_complete", "progress", "file_error", "finished",
+                "cancelled", "log_message", "workers_scaled", "paused", "resumed"):
+        getattr(mock_worker, sig).connect = MagicMock()
+
+    with patch("gui.collector_panel.DataCollectorWorker", return_value=mock_worker), \
+         patch("gui.collector_panel.CollectorRunRecord") as mock_rr:
+        mock_rr.load_or_create.return_value.status = "none"
+        mock_rr.load_or_create.return_value.is_complete.return_value = False
+        panel._on_collect()
+
+    assert panel._eta_label.text() == "Listing blobs…"
+
+
+def test_eta_label_clears_on_listing_complete():
+    panel = CollectorPanel()
+    panel._eta_label.setText("Listing blobs…")
+    panel._on_listing_complete(42)
     assert panel._eta_label.text() == ""
+
+
+def test_show_notification_skips_when_no_system_tray():
+    """_show_notification must not raise when system tray is unavailable."""
+    from unittest.mock import patch
+
+    panel = CollectorPanel()
+    with patch("gui.collector_panel.QSystemTrayIcon.isSystemTrayAvailable", return_value=False):
+        panel._show_notification("Test", "body")  # must not raise
+    assert panel._tray_icon is None
+
+
+def test_show_notification_creates_tray_icon_once():
+    """Tray icon is created lazily and reused across calls."""
+    from unittest.mock import MagicMock, patch
+
+    panel = CollectorPanel()
+    mock_tray = MagicMock()
+
+    with patch("gui.collector_panel.QSystemTrayIcon.isSystemTrayAvailable", return_value=True), \
+         patch("gui.collector_panel.QSystemTrayIcon", return_value=mock_tray) as mock_ctor:
+        panel._show_notification("T1", "B1")
+        panel._show_notification("T2", "B2")
+
+    mock_ctor.assert_called_once()  # only one tray icon created
+    assert mock_tray.showMessage.call_count == 2
 
 
 def test_log_entries_accumulate():
