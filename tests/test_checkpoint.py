@@ -14,9 +14,9 @@ from parquet_transform.checkpoint import FailedList, RunCheckpoint
 
 @pytest.fixture()
 def checkpoint_dir(tmp_path, monkeypatch):
-    """Redirect _CHECKPOINTS_DIR to a temp directory for all tests."""
+    """Redirect _CHECKPOINT_DIR to a temp directory for all tests."""
     import parquet_transform.checkpoint as cp_module
-    monkeypatch.setattr(cp_module, "_CHECKPOINTS_DIR", tmp_path)
+    monkeypatch.setattr(cp_module, "_CHECKPOINT_DIR", tmp_path)
     return tmp_path
 
 

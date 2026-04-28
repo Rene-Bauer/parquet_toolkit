@@ -18,9 +18,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-# Store checkpoints in the user's home directory so the app works without
-# elevated permissions when installed in a system-protected location (e.g. C:\).
-_CHECKPOINTS_DIR: Path = Path.home() / ".parquet_toolkit" / "checkpoints"
+_CHECKPOINT_DIR: Path = Path(__file__).parent.parent / "CollectorCheckpoint"
+"""Single directory for all checkpoint files: repo_root/CollectorCheckpoint/ (gitignored)."""
 
 
 def _sanitize_key(container: str, prefix: str) -> str:
@@ -34,7 +33,7 @@ def _sanitize_key(container: str, prefix: str) -> str:
 
 def _atomic_write(path: Path, data: dict) -> None:
     """Write *data* as JSON to *path* atomically via a sibling .tmp file."""
-    _CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -67,7 +66,7 @@ class RunCheckpoint:
     @staticmethod
     def checkpoint_path(container: str, prefix: str) -> Path:
         """Return the .json path for this container+prefix key."""
-        return _CHECKPOINTS_DIR / f"{_sanitize_key(container, prefix)}__checkpoint.json"
+        return _CHECKPOINT_DIR / f"{_sanitize_key(container, prefix)}__checkpoint.json"
 
     @staticmethod
     def load_or_create(
@@ -165,7 +164,7 @@ class FailedList:
     @staticmethod
     def failed_list_path(container: str, prefix: str) -> Path:
         """Return the .json path for this container+prefix key."""
-        return _CHECKPOINTS_DIR / f"{_sanitize_key(container, prefix)}__failed.json"
+        return _CHECKPOINT_DIR / f"{_sanitize_key(container, prefix)}__failed.json"
 
     @staticmethod
     def load_or_create(container: str, prefix: str) -> "FailedList":
@@ -266,7 +265,7 @@ class CollectorRunRecord:
     - "in_progress" — a run started but did not complete (cancelled / crashed)
     - "complete"    — a run finished and produced output_blob with row_count rows
 
-    File is stored under _CHECKPOINTS_DIR using a hash of the key so that
+    File is stored under _CHECKPOINT_DIR using a hash of the key so that
     different filters or prefixes never collide.
     """
 
@@ -288,7 +287,7 @@ class CollectorRunRecord:
         digest = hashlib.sha1(raw.encode()).hexdigest()[:8]
         c = re.sub(r"[^a-zA-Z0-9]", "_", container)
         p = re.sub(r"[^a-zA-Z0-9]", "_", prefix)
-        return _CHECKPOINTS_DIR / f"{c}__{p}__{digest}__collector_run.json"
+        return _CHECKPOINT_DIR / f"{c}__{p}__{digest}__collector_run.json"
 
     @staticmethod
     def load_or_create(
@@ -382,10 +381,6 @@ class CollectorRunRecord:
 # SubfolderCheckpoint
 # ---------------------------------------------------------------------------
 
-_SUBFOLDER_CHECKPOINT_DIR: Path = Path(__file__).parent.parent / "CollectorCheckpoint"
-"""Default directory for subfolder checkpoints: repo_root/CollectorCheckpoint/"""
-
-
 class SubfolderCheckpoint:
     """
     Per-run checkpoint for subfolder-by-subfolder collection mode.
@@ -440,7 +435,7 @@ class SubfolderCheckpoint:
         Does not create the file. Safe to call before load_or_create.
         *_checkpoint_dir* overrides the default storage location (tests only).
         """
-        directory = _checkpoint_dir or _SUBFOLDER_CHECKPOINT_DIR
+        directory = _checkpoint_dir or _CHECKPOINT_DIR
         return SubfolderCheckpoint._make_path(
             container, source_prefix, filter_col, filter_values, directory
         )
@@ -481,7 +476,7 @@ class SubfolderCheckpoint:
 
         Raises RuntimeError if the checkpoint file exists but is corrupt.
         """
-        directory = _checkpoint_dir or _SUBFOLDER_CHECKPOINT_DIR
+        directory = _checkpoint_dir or _CHECKPOINT_DIR
         path = SubfolderCheckpoint._make_path(
             container, source_prefix, filter_col, filter_values, directory
         )
@@ -586,7 +581,7 @@ class SubfolderCheckpoint:
 
     def _write(self) -> None:
         """Atomic write: temp file + os.replace."""
-        # Cannot reuse module-level _atomic_write(); that function targets _CHECKPOINTS_DIR.
+        # Cannot reuse module-level _atomic_write(); that function targets _CHECKPOINT_DIR.
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
