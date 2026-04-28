@@ -147,7 +147,8 @@ def test_log_entries_accumulate():
     assert color is not None   # errors have a colour
 
 
-def test_flush_log_writes_file_and_clears_entries(tmp_path, monkeypatch):
+def test_flush_log_clears_entries_without_writing_file(tmp_path, monkeypatch):
+    """_flush_log_to_file only clears the widget buffer; disk writes happen via the stream."""
     import gui.collector_panel as cp_mod
     monkeypatch.setattr(cp_mod, "_LOG_DIR_OVERRIDE", str(tmp_path))
     panel = CollectorPanel()
@@ -155,17 +156,59 @@ def test_flush_log_writes_file_and_clears_entries(tmp_path, monkeypatch):
     panel._flush_log_to_file()
     # Entries cleared after flush
     assert len(panel._log_entries) == 0
-    # A .txt file was written
-    files = list(tmp_path.iterdir())
-    assert len(files) == 1
-    content = files[0].read_text(encoding="utf-8")
-    assert "line1" in content
-    assert "line2" in content
+    # No file written by flush itself (streaming handles disk writes)
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_flush_count_increments():
     panel = CollectorPanel()
     assert panel._log_flush_count == 0
+
+
+def test_open_log_stream_creates_file(tmp_path, monkeypatch):
+    """_open_log_stream opens a writable file and exposes the path."""
+    import gui.collector_panel as cp_mod
+    monkeypatch.setattr(cp_mod, "_LOG_DIR_OVERRIDE", str(tmp_path))
+    panel = CollectorPanel()
+    panel._open_log_stream()
+    assert panel._log_stream is not None
+    assert panel._log_file_path is not None
+    assert panel._log_file_path.startswith(str(tmp_path))
+    assert panel._log_file_path.endswith(".txt")
+    panel._close_log_stream()
+
+
+def test_append_log_writes_to_stream(tmp_path, monkeypatch):
+    """Every log line is written to the stream file immediately."""
+    import gui.collector_panel as cp_mod
+    monkeypatch.setattr(cp_mod, "_LOG_DIR_OVERRIDE", str(tmp_path))
+    panel = CollectorPanel()
+    panel._open_log_stream()
+    panel._log_info("hello stream")
+    panel._log_error("an error")
+    panel._close_log_stream()
+    content = (tmp_path / panel._log_path_label.text().removeprefix("Streaming to: ")).read_text(encoding="utf-8")
+    assert "hello stream" in content
+    assert "an error" in content
+
+
+def test_close_log_stream_is_idempotent():
+    """Calling _close_log_stream twice must not raise."""
+    panel = CollectorPanel()
+    panel._close_log_stream()
+    panel._close_log_stream()
+
+
+def test_open_log_stream_closes_previous_stream(tmp_path, monkeypatch):
+    """Opening a second stream closes the first one."""
+    import gui.collector_panel as cp_mod
+    monkeypatch.setattr(cp_mod, "_LOG_DIR_OVERRIDE", str(tmp_path))
+    panel = CollectorPanel()
+    panel._open_log_stream()
+    first_stream = panel._log_stream
+    panel._open_log_stream()
+    assert first_stream.closed
+    panel._close_log_stream()
 
 
 def test_run_record_is_none_initially():

@@ -48,6 +48,8 @@ class CollectorPanel(QWidget):
         self._log_flush_count: int = 0
         self._run_record: CollectorRunRecord | None = None
         self._worker_cleanup_timer: QTimer | None = None
+        self._log_stream: "IO[str] | None" = None
+        self._log_file_path: str | None = None
         self._schema_worker: SchemaLoaderWorker | None = None
 
         root = QVBoxLayout(self)
@@ -241,6 +243,11 @@ class CollectorPanel(QWidget):
         self._log.setReadOnly(True)
         self._log.setMinimumHeight(140)
         layout.addWidget(self._log)
+
+        self._log_path_label = QLabel("")
+        self._log_path_label.setStyleSheet("color: gray; font-style: italic;")
+        self._log_path_label.setWordWrap(True)
+        layout.addWidget(self._log_path_label)
         return box
 
     # ------------------------------------------------------------------
@@ -295,6 +302,33 @@ class CollectorPanel(QWidget):
         if self._schema_worker is not None:
             self._schema_worker.deleteLater()
             self._schema_worker = None
+
+    def _open_log_stream(self) -> None:
+        self._close_log_stream()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"collector_log_{timestamp}.txt"
+        if _LOG_DIR_OVERRIDE:
+            log_dir = _LOG_DIR_OVERRIDE
+        else:
+            log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+        path = os.path.join(log_dir, filename)
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            self._log_stream = open(path, "w", encoding="utf-8")  # noqa: SIM115
+            self._log_file_path = path
+            self._log_path_label.setText(f"Streaming to: {filename}")
+        except Exception:
+            self._log_stream = None
+            self._log_file_path = None
+
+    def _close_log_stream(self) -> None:
+        if self._log_stream is not None:
+            try:
+                self._log_stream.flush()
+                self._log_stream.close()
+            except Exception:
+                pass
+            self._log_stream = None
 
     def _on_collect(self) -> None:
         conn = self._conn_edit.text().strip()
@@ -425,6 +459,7 @@ class CollectorPanel(QWidget):
         col_note = (
             f" [{len(selected_columns)} columns]" if selected_columns is not None else ""
         )
+        self._open_log_stream()
         self._log_info(
             f"Starting collection: {filter_col} "
             f"{filter_values} → {output_prefix}{col_note}"
@@ -547,6 +582,7 @@ class CollectorPanel(QWidget):
                 f"{len(out_blobs)} part(s): {', '.join(out_blobs)}"
             )
         self._resources_panel.clear_worker_throughput()
+        self._close_log_stream()
         self._request_worker_cleanup()
 
     def _on_cancelled(self) -> None:
@@ -560,6 +596,7 @@ class CollectorPanel(QWidget):
         self._log_info("Collection cancelled.")
         self._run_record = None
         self._resources_panel.clear_worker_throughput()
+        self._close_log_stream()
         self._request_worker_cleanup()
 
     def _on_workers_scaled(self, new_count: int, old_count: int, direction: str, reason: str) -> None:
@@ -577,6 +614,7 @@ class CollectorPanel(QWidget):
                 self._log_error("Data Collector is still stopping — close cancelled.")
                 event.ignore()
                 return
+        self._close_log_stream()
         self._request_worker_cleanup(force=True)
         super().closeEvent(event)
 
@@ -613,6 +651,12 @@ class CollectorPanel(QWidget):
         self._append_log(text, color=QColor("#cc0000"))
 
     def _append_log(self, text: str, color: QColor | None) -> None:
+        if self._log_stream is not None:
+            try:
+                self._log_stream.write(text + "\n")
+                self._log_stream.flush()
+            except Exception:
+                pass
         self._log_entries.append((text, color))
         if len(self._log_entries) >= MAX_LOG_ENTRIES:
             self._flush_log_to_file()
@@ -631,29 +675,16 @@ class CollectorPanel(QWidget):
         self._log.ensureCursorVisible()
 
     def _flush_log_to_file(self) -> None:
-        """Write all in-memory log entries to a timestamped file, then clear."""
+        """Clear the in-memory widget buffer; disk log is already streamed line-by-line."""
         self._log_flush_count += 1
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"collector_log_{timestamp}_{self._log_flush_count}.txt"
-        if _LOG_DIR_OVERRIDE:
-            log_dir = _LOG_DIR_OVERRIDE
-        else:
-            log_dir = os.path.join(
-                os.path.dirname(os.path.dirname(__file__)), "logs"
-            )
-        path = os.path.join(log_dir, filename)
-        try:
-            os.makedirs(log_dir, exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                for entry_text, _ in self._log_entries:
-                    f.write(entry_text + "\n")
-        except Exception:
-            pass  # best-effort: don't block the GUI for a flush failure
         self._log_entries.clear()
         self._log.clear()
         warn_color = QColor("#aa8800")
+        path_hint = (
+            os.path.basename(self._log_file_path) if self._log_file_path else "the log file"
+        )
         self._write_to_widget(
-            f"[Log flushed to {path} ({MAX_LOG_ENTRIES} entries) — continuing]",
+            f"[Widget cleared at {MAX_LOG_ENTRIES} entries — full log in: {path_hint}]",
             warn_color,
         )
 
