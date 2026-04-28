@@ -15,6 +15,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from azure.storage.blob import BlobServiceClient, ContainerClient
 
+try:
+    from azure.core.exceptions import ResourceNotFoundError as _ResourceNotFoundError
+except ImportError:  # pragma: no cover
+    _ResourceNotFoundError = Exception  # type: ignore[assignment,misc]
+
 
 def _extract_blob_size(blob) -> int:
     """
@@ -153,6 +158,52 @@ class BlobStorageClient:
         buf = io.BytesIO(raw)
         return pq.read_schema(buf)
 
+    def read_parquet_footer(self, blob_name: str) -> tuple[int, pa.Schema]:
+        """Read row count and Arrow schema from a blob's Parquet footer.
+
+        Uses two Azure range-download requests (total: footer_size + 8 bytes),
+        so this is efficient regardless of the blob's full size.
+
+        Raises RuntimeError if the blob is not a valid Parquet file or if
+        the footer cannot be parsed.
+        """
+        blob_client = self._container.get_blob_client(blob_name)
+        size: int = blob_client.get_blob_properties().size
+        if size < 8:
+            raise RuntimeError(
+                f"Blob {blob_name!r} is too small to be a Parquet file ({size} bytes)"
+            )
+
+        # Parquet trailer: [4-byte footer_length LE int32][4-byte magic "PAR1"]
+        tail = blob_client.download_blob(offset=size - 8, length=8).readall()
+        magic = tail[4:]
+        if magic != b"PAR1":
+            raise RuntimeError(
+                f"Blob {blob_name!r} is not a valid Parquet file "
+                f"(expected magic b'PAR1', got {magic!r})"
+            )
+
+        footer_length = int.from_bytes(tail[:4], "little")
+        if footer_length <= 0 or footer_length > size - 8:
+            raise RuntimeError(
+                f"Blob {blob_name!r}: invalid footer length {footer_length}"
+            )
+
+        footer_offset = size - 8 - footer_length
+        footer_bytes = blob_client.download_blob(
+            offset=footer_offset, length=footer_length + 8
+        ).readall()
+
+        buf = io.BytesIO(footer_bytes)
+        try:
+            metadata = pq.read_metadata(buf)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to parse Parquet footer of {blob_name!r}: {exc}"
+            ) from exc
+
+        return metadata.num_rows, metadata.schema.to_arrow_schema()
+
     # ------------------------------------------------------------------
     # Upload
     # ------------------------------------------------------------------
@@ -194,6 +245,14 @@ class BlobStorageClient:
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    def delete_blob(self, blob_name: str) -> None:
+        """Delete a blob. Silently ignores 404 (blob already gone)."""
+        blob_client = self._container.get_blob_client(blob_name)
+        try:
+            blob_client.delete_blob()
+        except _ResourceNotFoundError:
+            pass
 
     def close(self) -> None:
         """Close the underlying Azure SDK connection pool."""

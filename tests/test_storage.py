@@ -154,3 +154,114 @@ def test_list_blob_prefixes_strips_trailing_slash_from_input():
         result = client.list_blob_prefixes("archive")  # no trailing slash
 
     assert result == ["26-02-2026"]
+
+
+# ---------------------------------------------------------------------------
+# delete_blob
+# ---------------------------------------------------------------------------
+
+def test_delete_blob_calls_sdk():
+    from unittest.mock import MagicMock
+
+    mock_blob_client = MagicMock()
+    mock_container = MagicMock()
+    mock_container.get_blob_client.return_value = mock_blob_client
+
+    client = BlobStorageClient.__new__(BlobStorageClient)
+    client._container = mock_container
+
+    client.delete_blob("some/path.parquet")
+
+    mock_container.get_blob_client.assert_called_once_with("some/path.parquet")
+    mock_blob_client.delete_blob.assert_called_once()
+
+
+def test_delete_blob_swallows_resource_not_found():
+    """delete_blob must not raise when the blob does not exist."""
+    from unittest.mock import MagicMock
+    try:
+        from azure.core.exceptions import ResourceNotFoundError
+    except ImportError:
+        pytest.skip("azure-core not installed")
+
+    mock_blob_client = MagicMock()
+    mock_blob_client.delete_blob.side_effect = ResourceNotFoundError("not found")
+    mock_container = MagicMock()
+    mock_container.get_blob_client.return_value = mock_blob_client
+
+    client = BlobStorageClient.__new__(BlobStorageClient)
+    client._container = mock_container
+
+    client.delete_blob("nonexistent.parquet")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# read_parquet_footer
+# ---------------------------------------------------------------------------
+
+def _make_parquet_bytes_storage(n: int = 3) -> bytes:
+    import io
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    table = pa.table({"x": pa.array(list(range(n)), type=pa.int32()),
+                      "y": pa.array(["a"] * n, type=pa.string())})
+    buf = io.BytesIO()
+    pq.write_table(table, buf)
+    return buf.getvalue()
+
+
+def _make_range_mock(data: bytes):
+    """Return a mock container whose get_blob_client supports range downloads."""
+    from unittest.mock import MagicMock
+
+    mock_blob_client = MagicMock()
+    mock_props = MagicMock()
+    mock_props.size = len(data)
+    mock_blob_client.get_blob_properties.return_value = mock_props
+
+    def fake_download_blob(offset, length):
+        chunk = data[offset: offset + length]
+        downloader = MagicMock()
+        downloader.readall.return_value = chunk
+        return downloader
+
+    mock_blob_client.download_blob.side_effect = fake_download_blob
+
+    mock_container = MagicMock()
+    mock_container.get_blob_client.return_value = mock_blob_client
+    return mock_container
+
+
+def test_read_parquet_footer_returns_correct_row_count_and_schema():
+    import pyarrow as pa
+
+    data = _make_parquet_bytes_storage(n=7)
+
+    client = BlobStorageClient.__new__(BlobStorageClient)
+    client._container = _make_range_mock(data)
+
+    num_rows, schema = client.read_parquet_footer("test.parquet")
+
+    assert num_rows == 7
+    expected = pa.schema([("x", pa.int32()), ("y", pa.string())])
+    assert schema.equals(expected, check_metadata=False)
+
+
+def test_read_parquet_footer_raises_on_bad_magic():
+    """Blob whose last 4 bytes are not PAR1 → RuntimeError."""
+    bad_data = b"\x00" * 100 + b"NOPE"
+
+    client = BlobStorageClient.__new__(BlobStorageClient)
+    client._container = _make_range_mock(bad_data)
+
+    with pytest.raises(RuntimeError, match="PAR1"):
+        client.read_parquet_footer("bad.parquet")
+
+
+def test_read_parquet_footer_raises_when_blob_too_small():
+    """Blob smaller than 8 bytes → RuntimeError."""
+    client = BlobStorageClient.__new__(BlobStorageClient)
+    client._container = _make_range_mock(b"tiny")
+
+    with pytest.raises(RuntimeError, match="too small"):
+        client.read_parquet_footer("tiny.parquet")
