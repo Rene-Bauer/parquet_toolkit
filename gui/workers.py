@@ -1058,6 +1058,7 @@ class DataCollectorWorker(QThread):
         max_output_bytes: int = 0,
         start_part: int | None = None,   # when set, always use _part_NNN naming (subfolder mode)
         _is_subfolder_run: bool = False, # internal: prevents subfolder detection recursion
+        source_schema: "pa.Schema | None" = None,  # loaded from first blob; used for null-fill
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -1075,6 +1076,7 @@ class DataCollectorWorker(QThread):
         self._max_output_bytes = max_output_bytes
         self._start_part = start_part
         self._is_subfolder_run = _is_subfolder_run
+        self._source_schema = source_schema
         self._worker_count = max_workers
         self._cancel_event = threading.Event()
         self._pause_event = threading.Event()
@@ -1477,17 +1479,47 @@ class DataCollectorWorker(QThread):
                                 columns=self._selected_columns,
                                 filters=[(self._filter_col, "in", self._filter_values)],
                             )
-                            # Guard: some older source files may have been written
-                            # before all required columns existed. PyArrow silently
-                            # omits missing columns from the result rather than
-                            # raising, so we detect the gap explicitly and route it
-                            # as a per-file error rather than crashing the writer.
-                            missing = _REQUIRED_COLS - set(table.schema.names)
-                            if missing:
-                                raise ValueError(
-                                    f"File uses an older schema — missing required "
-                                    f"column(s): {sorted(missing)}. Rows skipped."
+                            # Generic schema-evolution fill: older files may be
+                            # missing columns added in a later schema version.
+                            # pq.read_table silently omits absent columns rather
+                            # than raising, so we detect the gap and null-fill
+                            # each missing field using its type from the loaded
+                            # source schema.  This preserves the rows instead of
+                            # skipping them.  MetadataAccumulator already calls
+                            # pc.drop_null() on combined triples, so null metadata
+                            # values are simply excluded from the Parquet footer.
+                            if self._source_schema is not None:
+                                have = set(table.schema.names)
+                                wanted = (
+                                    set(self._selected_columns)
+                                    if self._selected_columns is not None
+                                    else {f.name for f in self._source_schema}
                                 )
+                                schema_by_name = {
+                                    f.name: f for f in self._source_schema
+                                }
+                                for col_name in wanted - have:
+                                    if col_name in schema_by_name:
+                                        field = schema_by_name[col_name]
+                                        table = table.append_column(
+                                            field,
+                                            pa.array(
+                                                [None] * table.num_rows,
+                                                type=field.type,
+                                            ),
+                                        )
+                                # Restore consistent column order so the
+                                # ParquetWriter schema is stable across chunks.
+                                if self._selected_columns is not None:
+                                    table = table.select(self._selected_columns)
+                                else:
+                                    # Order by source schema when all columns
+                                    # are requested (no column selection).
+                                    ordered = [
+                                        f.name for f in self._source_schema
+                                        if f.name in set(table.schema.names)
+                                    ]
+                                    table = table.select(ordered)
                             matched_rows = table.num_rows
                             filtered = table
                             if scaler is not None:

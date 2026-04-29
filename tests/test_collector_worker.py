@@ -318,6 +318,95 @@ def test_pause_clears_event_and_resume_sets_it():
     assert w._pause_event.is_set()
 
 
+# --- schema-evolution: missing columns are null-filled, not skipped ---
+
+def _make_parquet_bytes_missing_col(
+    sender_uid: str,
+    device_uid: str,
+    n: int = 2,
+    omit_cols: list[str] | None = None,
+) -> bytes:
+    """Like _make_parquet_bytes but without the columns listed in omit_cols."""
+    omit = set(omit_cols or [])
+    data = {
+        "Id": [f"id{i}" for i in range(n)],
+        "SenderUid": [sender_uid] * n,
+        "DeviceUid": [device_uid] * n,
+        "DeviceType": ["T"] * n,
+        "DeviceManufacturer": ["M"] * n,
+        "TsCreate": pa.array(
+            [_ts_ms(2026, 4, 14, 23, 45, 8) + i * 1000 for i in range(n)],
+            type=pa.timestamp("ms", tz="UTC"),
+        ),
+        "MessageVersion": ["1.0"] * n,
+        "MessageType": ["X"] * n,
+        "Payload": [f"p{i}" for i in range(n)],
+    }
+    for col in omit:
+        data.pop(col, None)
+    buf = io.BytesIO()
+    pq.write_table(pa.table(data), buf)
+    return buf.getvalue()
+
+
+def test_worker_null_fills_missing_column_and_keeps_rows():
+    """Blobs missing a required column (e.g. MessageVersion, as happens with
+    old files pre-dating a schema change) must still be collected — their
+    rows are null-filled for the missing column instead of being skipped."""
+    full_schema = pq.read_schema(io.BytesIO(_make_parquet_bytes("uid1", "dev1", 1)))
+
+    new_bytes = _make_parquet_bytes("uid1", "dev1", 3)
+    old_bytes = _make_parquet_bytes_missing_col(
+        "uid1", "dev1", n=2, omit_cols=["MessageVersion"]
+    )
+
+    mock_client = MagicMock()
+    mock_client.list_blobs.return_value = ["p/new.parquet", "p/old.parquet"]
+    mock_client.list_blob_prefixes.return_value = []
+    mock_client.download_bytes.side_effect = _make_thread_safe_download_mock(
+        new_bytes, old_bytes
+    )
+    _configure_verify_passthrough(mock_client)
+
+    errors = []
+    with patch("gui.workers.BlobStorageClient", return_value=mock_client):
+        worker = _make_worker(source_schema=full_schema)
+        worker.file_error.connect(lambda b, e: errors.append(b))
+        results = _run_worker(worker)
+
+    # Both blobs' rows must be collected — none skipped
+    assert results["rowCount"] == 5
+    # No per-file errors emitted
+    assert errors == []
+    assert mock_client.upload_stream.call_count == 1
+
+
+def test_worker_without_source_schema_cancels_on_missing_col():
+    """When no source_schema is provided the null-fill logic is skipped.
+    PyArrow silently omits the missing column; MetadataAccumulator then raises
+    a KeyError accessing it in the writer thread, which cancels the entire run
+    rather than routing a per-file error.  This documents the degraded-mode
+    behaviour so we know passing source_schema is needed for old files."""
+    old_bytes = _make_parquet_bytes_missing_col(
+        "uid1", "dev1", n=2, omit_cols=["MessageVersion"]
+    )
+
+    mock_client = MagicMock()
+    mock_client.list_blobs.return_value = ["p/old.parquet"]
+    mock_client.list_blob_prefixes.return_value = []
+    mock_client.download_bytes.return_value = old_bytes
+
+    cancelled = []
+    with patch("gui.workers.BlobStorageClient", return_value=mock_client):
+        worker = _make_worker()   # no source_schema
+        worker.cancelled.connect(lambda: cancelled.append(True))
+        _run_worker(worker)
+
+    # Without schema, the writer thread crashes → run is cancelled, not finished
+    assert cancelled == [True]
+    assert mock_client.upload_stream.call_count == 0
+
+
 def test_cancel_unblocks_paused_worker():
     """cancel() must set the pause event so blocked producers can exit."""
     w = _make_worker()

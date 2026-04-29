@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import datetime as _dt
+
 import pyarrow as pa
 import pyarrow.compute as pc
+
+_EPOCH_UTC = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
 
 _REQUIRED_COLS = {"TsCreate", "SenderUid", "DeviceUid", "MessageVersion"}
 
@@ -90,10 +94,15 @@ class MetadataAccumulator:
         ts_col = _normalize_timestamp(chunk.column("TsCreate"))
         chunk_min = pc.min(ts_col).as_py()
         chunk_max = pc.max(ts_col).as_py()
-        if self._min_ts is None or chunk_min < self._min_ts:
-            self._min_ts = chunk_min
-        if self._max_ts is None or chunk_max > self._max_ts:
-            self._max_ts = chunk_max
+        # chunk_min/max are None when TsCreate is entirely null (schema-evolved
+        # files where the column was null-filled for missing rows).  Skip the
+        # comparison rather than raising a TypeError.
+        if chunk_min is not None:
+            if self._min_ts is None or chunk_min < self._min_ts:
+                self._min_ts = chunk_min
+        if chunk_max is not None:
+            if self._max_ts is None or chunk_max > self._max_ts:
+                self._max_ts = chunk_max
         # Build "SenderUid DeviceUid MessageVersion" strings at C++ speed,
         # deduplicate, then merge into the running set.
         # drop_null filters rows where any source column is null before
@@ -113,10 +122,15 @@ class MetadataAccumulator:
         def _fmt(dt) -> str:
             return dt.strftime("%m/%d/%Y %H:%M:%S +00:00")
 
+        # Fall back to epoch when every TsCreate value across all chunks was
+        # null (extremely degenerate case, but must not crash).
+        ts_from = self._min_ts if self._min_ts is not None else _EPOCH_UTC
+        ts_to   = self._max_ts if self._max_ts is not None else _EPOCH_UTC
+
         return {
             "recordCount": str(self._total_rows),
-            "dateFrom": _fmt(self._min_ts),
-            "dateTo": _fmt(self._max_ts),
+            "dateFrom": _fmt(ts_from),
+            "dateTo":   _fmt(ts_to),
             "deviceIds": ",".join(sorted(self._triples)),
             "batchNumber": "1",
         }

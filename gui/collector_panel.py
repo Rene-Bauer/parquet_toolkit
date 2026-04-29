@@ -55,6 +55,7 @@ class CollectorPanel(QWidget):
         self._log_file_path: str | None = None
         self._tray_icon: QSystemTrayIcon | None = None
         self._schema_worker: SchemaLoaderWorker | None = None
+        self._loaded_schema: "pa.Schema | None" = None
 
         root = QVBoxLayout(self)
         root.setSpacing(8)
@@ -285,6 +286,7 @@ class CollectorPanel(QWidget):
         total_bytes: int,
         unknown_size_names: list[str],
     ) -> None:
+        self._loaded_schema = schema
         self._schema_table.load_schema(schema)
         # Lock the four columns that MetadataAccumulator always needs for the
         # Parquet footer (dateFrom/dateTo/recordCount/deviceIds).  Without them
@@ -482,6 +484,7 @@ class CollectorPanel(QWidget):
             autoscale=self._autoscale_check.isChecked(),
             selected_columns=selected_columns,
             max_output_bytes=self._max_filesize_spin.value() * 1024 ** 3,
+            source_schema=self._loaded_schema,
         )
         self._worker.listing_complete.connect(self._on_listing_complete)
         self._worker.progress.connect(self._on_progress)

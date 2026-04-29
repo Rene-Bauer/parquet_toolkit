@@ -259,6 +259,75 @@ def test_accumulator_update_ignores_null_triples():
     assert "None" not in meta["deviceIds"]
 
 
+def test_accumulator_null_ts_create_does_not_crash():
+    """Chunk where TsCreate is entirely null (schema-filled) must not crash
+    and must still count rows. A subsequent chunk with real timestamps
+    must produce the correct date range."""
+    ts_real = _ts_ms(2026, 4, 14, 23, 45, 8)
+
+    # chunk 1: TsCreate all-null (schema-filled for an old file)
+    old_chunk = pa.table({
+        "Id": ["a", "b"],
+        "SenderUid": pa.array(["uid1", "uid1"], type=pa.string()),
+        "DeviceUid": pa.array(["dev1", "dev1"], type=pa.string()),
+        "DeviceType": ["T", "T"],
+        "DeviceManufacturer": ["M", "M"],
+        "TsCreate": pa.array([None, None], type=pa.timestamp("ms", tz="UTC")),
+        "MessageVersion": pa.array([None, None], type=pa.string()),
+        "MessageType": ["X", "X"],
+        "Payload": ["p1", "p2"],
+    })
+
+    # chunk 2: fully populated
+    new_chunk = pa.table({
+        "Id": ["c"],
+        "SenderUid": pa.array(["uid2"], type=pa.string()),
+        "DeviceUid": pa.array(["dev2"], type=pa.string()),
+        "DeviceType": ["T"],
+        "DeviceManufacturer": ["M"],
+        "TsCreate": pa.array([ts_real], type=pa.timestamp("ms", tz="UTC")),
+        "MessageVersion": pa.array(["1.0"], type=pa.string()),
+        "MessageType": ["X"],
+        "Payload": ["p3"],
+    })
+
+    acc = MetadataAccumulator()
+    acc.update(old_chunk)   # must not raise
+    acc.update(new_chunk)
+    meta = acc.to_metadata()
+
+    assert meta["recordCount"] == "3"
+    # timestamp range comes entirely from the second chunk
+    assert meta["dateFrom"] == "04/14/2026 23:45:08 +00:00"
+    assert meta["dateTo"] == "04/14/2026 23:45:08 +00:00"
+    # null MessageVersion rows are excluded from triples; uid2 row is present
+    assert "uid2 dev2 1.0" in meta["deviceIds"]
+    assert "None" not in meta["deviceIds"]
+
+
+def test_accumulator_all_null_ts_falls_back_to_epoch():
+    """When every chunk has null TsCreate, to_metadata must not crash and
+    must use the epoch sentinel for dateFrom/dateTo."""
+    chunk = pa.table({
+        "Id": ["a"],
+        "SenderUid": pa.array(["uid1"], type=pa.string()),
+        "DeviceUid": pa.array(["dev1"], type=pa.string()),
+        "DeviceType": ["T"],
+        "DeviceManufacturer": ["M"],
+        "TsCreate": pa.array([None], type=pa.timestamp("ms", tz="UTC")),
+        "MessageVersion": pa.array(["1.0"], type=pa.string()),
+        "MessageType": ["X"],
+        "Payload": ["p1"],
+    })
+    acc = MetadataAccumulator()
+    acc.update(chunk)
+    meta = acc.to_metadata()   # must not raise
+
+    assert meta["recordCount"] == "1"
+    assert meta["dateFrom"] == "01/01/1970 00:00:00 +00:00"
+    assert meta["dateTo"] == "01/01/1970 00:00:00 +00:00"
+
+
 # --- rewrite_with_metadata ---
 
 def test_rewrite_with_metadata_produces_valid_parquet(tmp_path):
