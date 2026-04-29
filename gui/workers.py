@@ -1225,6 +1225,7 @@ class DataCollectorWorker(QThread):
         import os
         import tempfile
         from parquet_transform.collector import (
+            _REQUIRED_COLS,
             make_output_blob_name,
             MetadataAccumulator,
             rewrite_with_metadata,
@@ -1476,6 +1477,17 @@ class DataCollectorWorker(QThread):
                                 columns=self._selected_columns,
                                 filters=[(self._filter_col, "in", self._filter_values)],
                             )
+                            # Guard: some older source files may have been written
+                            # before all required columns existed. PyArrow silently
+                            # omits missing columns from the result rather than
+                            # raising, so we detect the gap explicitly and route it
+                            # as a per-file error rather than crashing the writer.
+                            missing = _REQUIRED_COLS - set(table.schema.names)
+                            if missing:
+                                raise ValueError(
+                                    f"File uses an older schema — missing required "
+                                    f"column(s): {sorted(missing)}. Rows skipped."
+                                )
                             matched_rows = table.num_rows
                             filtered = table
                             if scaler is not None:
