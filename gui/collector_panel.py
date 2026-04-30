@@ -35,7 +35,7 @@ _LOG_DIR_OVERRIDE: str | None = None
 from gui.collector_schema_table import CollectorSchemaTable
 from gui.resources_panel import ResourcesPanel
 from gui.workers import DataCollectorWorker, SchemaLoaderWorker, _format_duration
-from parquet_transform.collector import _REQUIRED_COLS
+from parquet_transform.collector import _REQUIRED_COLS, _LOCKED_COLS
 from parquet_transform.checkpoint import CollectorRunRecord, SubfolderCheckpoint
 
 
@@ -291,10 +291,10 @@ class CollectorPanel(QWidget):
         # Lock the four columns that MetadataAccumulator always needs for the
         # Parquet footer (dateFrom/dateTo/recordCount/deviceIds).  Without them
         # the writer thread crashes with a KeyError when building metadata.
-        self._schema_table.lock_columns(sorted(_REQUIRED_COLS))
+        self._schema_table.lock_columns(sorted(_LOCKED_COLS))
         self._schema_group.setVisible(True)
         plural = "s" if file_count != 1 else ""
-        locked_str = ", ".join(sorted(_REQUIRED_COLS))
+        locked_str = ", ".join(sorted(_LOCKED_COLS))
         self._log_info(
             f"Schema loaded: {len(schema)} column(s), {file_count} file{plural}. "
             f"Required columns locked: {locked_str}."

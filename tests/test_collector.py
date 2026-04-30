@@ -131,6 +131,24 @@ def test_make_output_blob_name_multiple_ids_with_spaces():
     assert name == "out/SenderUid_100413_156412_1.0_100412_141978_1.0.parquet"
 
 
+def test_make_output_blob_name_strips_trailing_newline():
+    """Filter values read from Parquet may carry a trailing newline or CR."""
+    name = make_output_blob_name("out/", "DeviceUid", ["1800A_10.0.1.111\n"])
+    assert name == "out/DeviceUid_1800A_10.0.1.111.parquet"
+
+
+def test_make_output_blob_name_replaces_colon_and_other_invalid_chars():
+    """Colons, pipes, question-marks, etc. are not valid in Azure blob names."""
+    name = make_output_blob_name("out/", "DeviceUid", ["device:10.0.1.1", "uid|2"])
+    assert name == "out/DeviceUid_device_10.0.1.1_uid_2.parquet"
+
+
+def test_make_output_blob_name_preserves_dots_hyphens_underscores():
+    """Dots, hyphens, and underscores inside IDs must be kept as-is."""
+    name = make_output_blob_name("out/", "DeviceUid", ["1800A_10.0.1.111"])
+    assert name == "out/DeviceUid_1800A_10.0.1.111.parquet"
+
+
 def test_build_metadata_missing_column_raises():
     table = pa.table({"Id": ["a"], "SenderUid": ["uid1"]})  # missing required cols
     with pytest.raises(ValueError, match="missing required columns"):

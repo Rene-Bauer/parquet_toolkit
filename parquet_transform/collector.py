@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import datetime as _dt
+import re
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
+# Characters that are safe inside an Azure Blob Storage path segment.
+# Alphanumeric + underscore + hyphen + dot.  Everything else is replaced
+# with underscore when building output blob names from filter values.
+_UNSAFE_BLOB_CHARS = re.compile(r"[^a-zA-Z0-9._\-]")
+
 _EPOCH_UTC = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
 
 _REQUIRED_COLS = {"TsCreate", "SenderUid", "DeviceUid", "MessageVersion"}
+
+# Columns that are always pre-selected and locked in the UI so the user
+# cannot accidentally omit them.  _REQUIRED_COLS are needed by
+# MetadataAccumulator; Payload is the primary data column users always want.
+_LOCKED_COLS: frozenset[str] = frozenset(_REQUIRED_COLS | {"Payload"})
 
 
 def filter_table_by_ids(table: pa.Table, filter_col: str, filter_values: list[str]) -> pa.Table:
@@ -67,7 +78,13 @@ def make_output_blob_name(
     if part is not None and part < 1:
         raise ValueError(f"part must be a positive integer, got {part!r}")
     prefix = output_prefix.rstrip("/")
-    ids_part = "_".join(v.replace(" ", "_") for v in filter_values)
+    # Sanitize each filter value: strip surrounding whitespace (guards against
+    # trailing newlines / control chars from Parquet string columns) then
+    # replace any character that Azure Blob Storage rejects in a path segment
+    # with an underscore.
+    ids_part = "_".join(
+        _UNSAFE_BLOB_CHARS.sub("_", v.strip()) for v in filter_values
+    )
     base = f"{prefix}/{filter_col}_{ids_part}"
     if part is not None:
         return f"{base}_part_{part:03d}.parquet"
