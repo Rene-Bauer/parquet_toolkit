@@ -149,6 +149,40 @@ def test_make_output_blob_name_preserves_dots_hyphens_underscores():
     assert name == "out/DeviceUid_1800A_10.0.1.111.parquet"
 
 
+def test_make_output_blob_name_long_ids_uses_hash():
+    """When joined IDs exceed _MAX_IDS_PART_LEN the name uses a hash stub."""
+    from parquet_transform.collector import _MAX_IDS_PART_LEN
+    # Build enough IDs to exceed the threshold
+    ids = [f"device_{i:04d}_10.0.1.{i % 256}" for i in range(30)]
+    name = make_output_blob_name("out/", "DeviceUid", ids)
+    # Must be a valid parquet path
+    assert name.endswith(".parquet")
+    # The ids part must use the hash stub format: Nids_<hex>
+    segment = name.split("/")[-1]          # filename only
+    ids_part = segment[len("DeviceUid_"):-len(".parquet")]
+    assert ids_part.startswith(f"{len(ids)}ids_")
+    # Must be well within Azure's 1 024-byte limit
+    assert len(name) < 1024
+
+
+def test_make_output_blob_name_long_ids_hash_is_deterministic():
+    """Same set of IDs must always produce the same hash stub."""
+    ids = [f"device_{i:04d}" for i in range(30)]
+    name1 = make_output_blob_name("out/", "DeviceUid", ids)
+    name2 = make_output_blob_name("out/", "DeviceUid", ids)
+    assert name1 == name2
+
+
+def test_make_output_blob_name_long_ids_hash_is_order_independent():
+    """Hash stub must be the same regardless of the order IDs are supplied."""
+    ids = [f"device_{i:04d}" for i in range(30)]
+    import random
+    shuffled = ids[:]
+    random.shuffle(shuffled)
+    assert make_output_blob_name("out/", "DeviceUid", ids) == \
+           make_output_blob_name("out/", "DeviceUid", shuffled)
+
+
 def test_build_metadata_missing_column_raises():
     table = pa.table({"Id": ["a"], "SenderUid": ["uid1"]})  # missing required cols
     with pytest.raises(ValueError, match="missing required columns"):

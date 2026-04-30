@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import re
 
 import pyarrow as pa
@@ -10,6 +11,11 @@ import pyarrow.compute as pc
 # Alphanumeric + underscore + hyphen + dot.  Everything else is replaced
 # with underscore when building output blob names from filter values.
 _UNSAFE_BLOB_CHARS = re.compile(r"[^a-zA-Z0-9._\-]")
+
+# When the joined IDs part of a blob name exceeds this many characters,
+# substitute a short deterministic hash to stay well inside Azure's
+# 1 024-byte blob name limit regardless of prefix depth or ID count.
+_MAX_IDS_PART_LEN = 200
 
 _EPOCH_UTC = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
 
@@ -82,9 +88,16 @@ def make_output_blob_name(
     # trailing newlines / control chars from Parquet string columns) then
     # replace any character that Azure Blob Storage rejects in a path segment
     # with an underscore.
-    ids_part = "_".join(
-        _UNSAFE_BLOB_CHARS.sub("_", v.strip()) for v in filter_values
-    )
+    clean_values = [_UNSAFE_BLOB_CHARS.sub("_", v.strip()) for v in filter_values]
+    ids_part = "_".join(clean_values)
+    # Guard: if the joined IDs string is too long, replace it with a short
+    # deterministic hash so the final blob name always fits within Azure's
+    # 1 024-byte limit, no matter how many IDs are filtered.
+    if len(ids_part) > _MAX_IDS_PART_LEN:
+        digest = hashlib.sha256(
+            "\n".join(sorted(clean_values)).encode()
+        ).hexdigest()[:12]
+        ids_part = f"{len(filter_values)}ids_{digest}"
     base = f"{prefix}/{filter_col}_{ids_part}"
     if part is not None:
         return f"{base}_part_{part:03d}.parquet"
