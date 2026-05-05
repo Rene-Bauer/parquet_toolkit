@@ -59,3 +59,54 @@ class TestCollectorRunRecord:
         path.write_text("not valid json", encoding="utf-8")
         with pytest.raises(RuntimeError, match="corrupt"):
             CollectorRunRecord.load_or_create("cont", "prefix/", "SenderUid", ["uid1"])
+
+
+class TestAtomicWriteConcurrency:
+    """_atomic_write must survive concurrent calls from multiple threads
+    targeting the same destination file (the scenario that caused the
+    Windows PermissionError crash in the field)."""
+
+    def test_concurrent_writes_produce_valid_json(self, checkpoint_dir):
+        """Many threads writing to the same path must not corrupt the file."""
+        import threading
+        from parquet_transform.checkpoint import _atomic_write
+
+        target = checkpoint_dir / "concurrent_test.json"
+        errors = []
+
+        def _writer(n: int) -> None:
+            try:
+                _atomic_write(target, {"writer": n})
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_writer, args=(i,)) for i in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Concurrent writes raised: {errors}"
+        # File must be valid JSON after all writers finish
+        import json
+        data = json.loads(target.read_text(encoding="utf-8"))
+        assert "writer" in data
+
+    def test_no_orphaned_tmp_files_after_concurrent_writes(self, checkpoint_dir):
+        """Unique temp names mean each write cleans up its own .tmp on success."""
+        import threading
+        from parquet_transform.checkpoint import _atomic_write
+
+        target = checkpoint_dir / "orphan_test.json"
+
+        def _writer(n: int) -> None:
+            _atomic_write(target, {"writer": n})
+
+        threads = [threading.Thread(target=_writer, args=(i,)) for i in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        tmp_files = list(checkpoint_dir.glob("*.tmp"))
+        assert tmp_files == [], f"Orphaned .tmp files found: {tmp_files}"
