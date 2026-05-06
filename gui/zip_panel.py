@@ -346,7 +346,7 @@ class ZipPanel(QWidget):
             )
         self._set_idle_state()
         self._close_log_stream()
-        self._schedule_worker_cleanup()
+        self._request_worker_cleanup()
 
     def _on_cancelled(self) -> None:
         elapsed = perf_counter() - self._run_start_time
@@ -354,7 +354,7 @@ class ZipPanel(QWidget):
         self._log_info("Cancelled by user.")
         self._set_idle_state()
         self._close_log_stream()
-        self._schedule_worker_cleanup()
+        self._request_worker_cleanup()
 
     def _on_workers_scaled(self, new_count: int, old_count: int,
                            direction: str, reason: str) -> None:
@@ -382,19 +382,27 @@ class ZipPanel(QWidget):
         self._progress.setVisible(False)
         self._is_paused = False
 
-    def _schedule_worker_cleanup(self) -> None:
-        if self._worker_cleanup_timer is not None:
-            self._worker_cleanup_timer.stop()
-        timer = QTimer(self)
-        timer.setSingleShot(True)
-        timer.timeout.connect(self._cleanup_worker)
-        timer.start(200)
-        self._worker_cleanup_timer = timer
+    def _request_worker_cleanup(self, force: bool = False) -> None:
+        """Dispose the worker only after its QThread stops running."""
+        if self._worker is None:
+            return
+        if force or not self._worker.isRunning():
+            self._finalize_worker()
+            return
+        if self._worker_cleanup_timer is None:
+            self._worker_cleanup_timer = QTimer(self)
+            self._worker_cleanup_timer.setSingleShot(True)
+            self._worker_cleanup_timer.timeout.connect(self._request_worker_cleanup)
+        if not self._worker_cleanup_timer.isActive():
+            self._worker_cleanup_timer.start(100)
 
-    def _cleanup_worker(self) -> None:
-        if self._worker is not None:
-            self._worker.deleteLater()
-            self._worker = None
+    def _finalize_worker(self) -> None:
+        if self._worker is None:
+            return
+        if self._worker_cleanup_timer is not None and self._worker_cleanup_timer.isActive():
+            self._worker_cleanup_timer.stop()
+        self._worker.deleteLater()
+        self._worker = None
 
     # ------------------------------------------------------------------
     # Log helpers
@@ -420,21 +428,17 @@ class ZipPanel(QWidget):
         self._write_to_widget(text, color)
 
     def _flush_log_to_file(self) -> None:
+        """Clear the in-memory widget buffer; disk log is already streamed line-by-line."""
         self._log_flush_count += 1
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"zip_converter_log_{timestamp}_{self._log_flush_count}.txt"
-        log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        path = os.path.join(log_dir, filename)
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                for entry_text, _ in self._log_entries:
-                    f.write(entry_text + "\n")
-        except Exception:
-            pass
         self._log_entries.clear()
         self._log.clear()
-        self._write_to_widget(f"[Log flushed to {path}]", _COLOR_WARN)
+        path_hint = (
+            os.path.basename(self._log_file_path) if self._log_file_path else "the log file"
+        )
+        self._write_to_widget(
+            f"[Widget cleared at {MAX_LOG_ENTRIES} entries — full log in: {path_hint}]",
+            _COLOR_WARN,
+        )
 
     def _write_to_widget(self, text: str, color: QColor | None) -> None:
         cursor = self._log.textCursor()
@@ -497,6 +501,7 @@ class ZipPanel(QWidget):
             except Exception:
                 pass
             self._log_stream = None
+            self._log_file_path = None
             self._log_path_label.setText("")
 
     def _show_notification(self, title: str, body: str) -> None:
