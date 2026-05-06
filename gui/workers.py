@@ -177,6 +177,7 @@ class _FileResult:
     retriable: bool = True
     upload_bytes: int = 0       # > 0 only on successful upload (for calibration)
     upload_seconds: float = 0.0 # wall-clock seconds for the upload step only
+    rows_converted: int = 0     # populated by ZipConverterWorker on success
 
 
 def _first_line(text: str) -> str:
@@ -1926,7 +1927,7 @@ class ZipConverterWorker(QThread):
                     upload_bytes=upload_bytes_count,
                     upload_seconds=upload_seconds,
                 )
-                result._rows_converted = merged.num_rows  # type: ignore[attr-defined]
+                result.rows_converted = merged.num_rows
                 return result
 
             except Exception as exc:
@@ -2081,7 +2082,7 @@ class ZipConverterWorker(QThread):
                                 scaler.record_upload(0, 0.0, False)
 
                         if result.status == "success":
-                            rows = getattr(result, "_rows_converted", 0)
+                            rows = result.rows_converted
                             finalize_success(
                                 blob_name=blob_name, worker_id=worker_id,
                                 duration_ms=aggregated_duration, rows_converted=rows,
