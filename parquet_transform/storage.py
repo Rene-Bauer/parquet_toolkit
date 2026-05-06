@@ -96,6 +96,19 @@ class BlobStorageClient:
             if b.name.endswith(".parquet")
         ]
 
+    def list_zip_blobs_with_sizes(self, prefix: str) -> list[tuple[str, int]]:
+        """Return (blob_name, size_bytes) for all .zip blobs under *prefix*.
+
+        Mirrors ``list_blobs_with_sizes`` but filters for ``.zip`` files
+        instead of ``.parquet`` files.  Size is -1 when unknown.
+        """
+        blobs = self._container.list_blobs(name_starts_with=prefix)
+        return [
+            (b.name, _extract_blob_size(b))
+            for b in blobs
+            if b.name.endswith(".zip")
+        ]
+
     def list_blob_prefixes(self, prefix: str) -> list[str]:
         """Return direct virtual-subdirectory names under *prefix* (sorted).
 

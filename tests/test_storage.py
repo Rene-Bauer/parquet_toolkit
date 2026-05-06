@@ -313,3 +313,43 @@ def test_list_first_parquet_blob_returns_none_when_empty():
     client._container = mock_container
 
     assert client.list_first_parquet_blob("empty/") is None
+
+
+# ---------------------------------------------------------------------------
+# list_zip_blobs_with_sizes
+# ---------------------------------------------------------------------------
+
+def test_list_zip_blobs_with_sizes_returns_only_zip_files():
+    """list_zip_blobs_with_sizes must return only .zip blobs."""
+    from unittest.mock import MagicMock
+
+    blob_zip  = MagicMock(); blob_zip.name  = "prefix/file.zip";     blob_zip.size  = 1000
+    blob_par  = MagicMock(); blob_par.name  = "prefix/file.parquet"; blob_par.size  = 500
+    blob_zip2 = MagicMock(); blob_zip2.name = "prefix/sub/more.zip"; blob_zip2.size = 200
+
+    mock_container = MagicMock()
+    mock_container.list_blobs.return_value = iter([blob_zip, blob_par, blob_zip2])
+
+    client = BlobStorageClient.__new__(BlobStorageClient)
+    client._container = mock_container
+
+    result = client.list_zip_blobs_with_sizes("prefix/")
+    names = [n for n, _ in result]
+
+    assert "prefix/file.zip" in names
+    assert "prefix/sub/more.zip" in names
+    assert "prefix/file.parquet" not in names
+
+
+def test_list_zip_blobs_with_sizes_empty_prefix():
+    """Returns empty list when no ZIP blobs exist."""
+    from unittest.mock import MagicMock
+
+    mock_container = MagicMock()
+    mock_container.list_blobs.return_value = iter([])
+
+    client = BlobStorageClient.__new__(BlobStorageClient)
+    client._container = mock_container
+
+    result = client.list_zip_blobs_with_sizes("noblobs/")
+    assert result == []
