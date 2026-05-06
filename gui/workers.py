@@ -1921,14 +1921,13 @@ class ZipConverterWorker(QThread):
                 upload_seconds = perf_counter() - t_upload
                 upload_bytes_count = _os.path.getsize(tmp_path)
 
-                result = _FileResult(
+                return _FileResult(
                     status="success",
                     duration_ms=(perf_counter() - file_start) * 1000.0,
                     upload_bytes=upload_bytes_count,
                     upload_seconds=upload_seconds,
+                    rows_converted=merged.num_rows,
                 )
-                result.rows_converted = merged.num_rows
-                return result
 
             except Exception as exc:
                 short_error, suppress_trace, retriable = _summarize_exception(exc)
