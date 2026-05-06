@@ -1725,3 +1725,468 @@ class DataCollectorWorker(QThread):
             # bypassed all normal exit paths without emitting a terminal signal.
             if not _emitted[0]:
                 self.finished.emit({"rowCount": 0})
+
+
+# ---------------------------------------------------------------------------
+# ZIP → Parquet Converter Worker
+# ---------------------------------------------------------------------------
+
+class ZipConverterWorker(QThread):
+    """
+    Parallel ZIP-to-Parquet converter.
+
+    Downloads .zip blobs from Azure, extracts all CSV files found inside each
+    archive, merges them into a single PyArrow table, and uploads the result
+    as a .parquet blob.
+
+    Reuses the same run-pass / retry-loop / AdaptiveScaler / pause / cancel
+    pattern as TransformWorker.  The only new behaviour is _process_zip_once.
+    """
+
+    listing_complete = pyqtSignal(int)
+    progress = pyqtSignal(int, int, str, float, int, int)
+    # completed, total, blob_name, duration_ms, worker_id, rows_converted
+    file_error = pyqtSignal(str, str)
+    finished = pyqtSignal(dict)          # {"rowCount": int, "fileCount": int}
+    cancelled = pyqtSignal()
+    log_message = pyqtSignal(str)
+    workers_scaled = pyqtSignal(int, int, str, str)
+    paused = pyqtSignal()
+    resumed = pyqtSignal()
+
+    def __init__(
+        self,
+        connection_string: str,
+        container: str,
+        source_prefix: str,
+        output_prefix: str,
+        max_workers: int = 4,
+        autoscale: bool = True,
+        max_attempts: int = 5,
+        csv_delimiter: str = ",",
+        csv_encoding: str = "utf-8",
+        blob_names: list[str] | None = None,
+        blob_sizes: dict[str, int] | None = None,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._conn = connection_string
+        self._container_name = container
+        self._source_prefix = source_prefix
+        self._output_prefix = output_prefix
+        self._worker_count = max(1, max_workers)
+        self._autoscale = autoscale
+        self._max_attempts = max(1, max_attempts)
+        self._csv_delimiter = csv_delimiter
+        self._csv_encoding = csv_encoding
+        self._blob_names = blob_names
+        self._blob_sizes = blob_sizes
+        self._cancel_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # starts unpaused
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+        self._pause_event.set()  # unblock any paused threads
+
+    def pause(self) -> None:
+        self._pause_event.clear()
+        self.paused.emit()
+
+    def resume(self) -> None:
+        self._pause_event.set()
+        self.resumed.emit()
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    def run(self) -> None:
+        import tempfile, os as _os
+        from parquet_transform.csv_converter import (
+            extract_csv_tables,
+            merge_tables,
+            compute_zip_output_name,
+        )
+
+        blob_sizes: dict[str, int] = {}
+
+        if self._blob_names is not None:
+            blob_names = list(self._blob_names)
+            if self._blob_sizes is not None:
+                blob_sizes = dict(self._blob_sizes)
+        else:
+            try:
+                listing_client = BlobStorageClient(self._conn, self._container_name)
+                raw_list = listing_client.list_zip_blobs_with_sizes(self._source_prefix)
+                listing_client.close()
+                blob_names = [name for name, _ in raw_list]
+                blob_sizes = {name: size for name, size in raw_list if size >= 0}
+                self.listing_complete.emit(len(blob_names))
+            except Exception:
+                self.file_error.emit("(connection)", traceback.format_exc())
+                self.finished.emit({"rowCount": 0, "fileCount": 0})
+                return
+
+        total = len(blob_names)
+        if total == 0:
+            self.finished.emit({"rowCount": 0, "fileCount": 0})
+            return
+
+        # p95 file size for scaler
+        p95_bytes = 0
+        if blob_sizes:
+            sorted_sizes = sorted(s for s in blob_sizes.values() if s > 0)
+            if sorted_sizes:
+                p95_idx = max(0, int(len(sorted_sizes) * 0.95) - 1)
+                p95_bytes = sorted_sizes[p95_idx]
+
+        # Shared counters
+        stats_lock = threading.Lock()
+        converted_files = 0
+        total_rows = 0
+        completed = 0
+        total_duration_ms = 0.0
+        start_time = perf_counter()
+        attempt_counter: dict[str, int] = {}
+        duration_tracker: dict[str, float] = {}
+        retriable_failed_names: list[str] = []
+        # Error queue: background threads push (blob_name, error_msg) tuples here;
+        # file_error is drained on the main run() thread to guarantee Qt delivery
+        # without requiring an event loop (same pattern as DataCollectorWorker).
+        error_queue: queue.Queue = queue.Queue()
+
+        # Adaptive scaler (only when autoscale=True)
+        scaler: AdaptiveScaler | None = None
+        self._completed_since_scale_check = 0
+        self._pending_force_scale = False
+        self._real_work_started = False
+        if self._autoscale:
+            scaler = AdaptiveScaler(
+                window_size=SCALER_WINDOW_SIZE,
+                min_samples=SCALER_MIN_SAMPLES,
+                upload_timeout_s=UPLOAD_TIMEOUT_S,
+                down_error_rate=SCALER_DOWN_ERROR_RATE,
+                down_throughput_drop=SCALER_DOWN_THROUGHPUT_DROP,
+                up_min_headroom=SCALER_UP_MIN_HEADROOM,
+                up_confirm_checks=SCALER_UP_CONFIRM_CHECKS,
+                up_max_step=SCALER_UP_MAX_STEP,
+                configured_max_workers=self._worker_count,
+                hot_error_rate=SCALER_HOT_ERROR_RATE,
+                hot_error_min_samples=SCALER_HOT_ERROR_MIN_SAMPLES,
+                recovery_error_ceiling=SCALER_RECOVERY_ERROR_CEILING,
+                overrun_headroom_threshold=SCALER_OVERRUN_HEADROOM_THRESHOLD,
+                plateau_threshold=SCALER_PLATEAU_THRESHOLD,
+                usl_min_levels=SCALER_USL_MIN_LEVELS,
+                usl_min_samples_per_level=SCALER_USL_MIN_SAMPLES_PER_LEVEL,
+                usl_agree_tolerance=SCALER_USL_AGREE_TOLERANCE,
+            )
+
+        def _process_zip_once(client: BlobStorageClient, blob_name: str) -> "_FileResult":
+            """Download a ZIP blob, convert all CSVs inside it, upload as Parquet."""
+            file_start = perf_counter()
+            tmp_path: str | None = None
+            try:
+                raw = client.download_bytes(blob_name, timeout=DOWNLOAD_TIMEOUT_S)
+                tables = extract_csv_tables(
+                    raw,
+                    delimiter=self._csv_delimiter,
+                    encoding=self._csv_encoding,
+                )
+                if not tables:
+                    return _FileResult(
+                        status="error",
+                        duration_ms=(perf_counter() - file_start) * 1000.0,
+                        error=f"No CSV files found in {blob_name!r}",
+                        short_error="No CSV files in ZIP",
+                        suppress_trace=False,
+                        retriable=False,
+                    )
+                merged = merge_tables(tables)
+                output_name = compute_zip_output_name(
+                    blob_name, self._source_prefix, self._output_prefix
+                )
+
+                fd, tmp_path = tempfile.mkstemp(suffix=".parquet", prefix="zipconv_")
+                _os.close(fd)
+                pq.write_table(merged, tmp_path, compression="zstd", compression_level=3)
+
+                t_upload = perf_counter()
+                _upload_verify_with_retry(
+                    client, output_name, tmp_path,
+                    expected_rows=merged.num_rows,
+                    expected_schema=merged.schema,
+                )
+                upload_seconds = perf_counter() - t_upload
+                upload_bytes_count = _os.path.getsize(tmp_path)
+
+                result = _FileResult(
+                    status="success",
+                    duration_ms=(perf_counter() - file_start) * 1000.0,
+                    upload_bytes=upload_bytes_count,
+                    upload_seconds=upload_seconds,
+                )
+                result._rows_converted = merged.num_rows  # type: ignore[attr-defined]
+                return result
+
+            except Exception as exc:
+                short_error, suppress_trace, retriable = _summarize_exception(exc)
+                return _FileResult(
+                    status="error",
+                    duration_ms=(perf_counter() - file_start) * 1000.0,
+                    error=traceback.format_exc(),
+                    short_error=short_error,
+                    suppress_trace=suppress_trace,
+                    retriable=retriable,
+                )
+            finally:
+                if tmp_path is not None:
+                    try:
+                        _os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+        def finalize_success(*, blob_name, worker_id, duration_ms, rows_converted):
+            nonlocal converted_files, total_rows, completed, total_duration_ms
+            with stats_lock:
+                converted_files += 1
+                total_rows += rows_converted
+                completed += 1
+                completed_so_far = completed
+                total_duration_ms += duration_ms
+                if scaler is not None:
+                    self._completed_since_scale_check += 1
+                    if not self._real_work_started:
+                        self._real_work_started = True
+                        self._pending_force_scale = True
+            self.progress.emit(
+                completed_so_far, total, blob_name,
+                duration_ms, worker_id, rows_converted,
+            )
+
+        def finalize_failure(*, blob_name, worker_id, duration_ms,
+                             error, short_error, suppress_trace, retriable):
+            nonlocal completed, total_duration_ms
+            with stats_lock:
+                if retriable:
+                    retriable_failed_names.append(blob_name)
+                completed += 1
+                completed_so_far = completed
+                total_duration_ms += duration_ms
+                if scaler is not None and retriable:
+                    self._completed_since_scale_check += 1
+            # Push to queue so file_error is emitted on the main run() thread
+            # (avoids Qt queued-connection issues when emitting from bg threads).
+            error_queue.put((blob_name, error or short_error))
+            self.progress.emit(completed_so_far, total, blob_name,
+                               duration_ms, worker_id, 0)
+
+        def run_pass(blob_batch: list[str]) -> list[str]:
+            if not blob_batch or self._cancel_event.is_set():
+                return []
+
+            worker_total = min(self._worker_count, len(blob_batch))
+            task_queue: queue.Queue = queue.Queue()
+            for name in blob_batch:
+                task_queue.put(name)
+
+            next_round: list[str] = []
+            next_round_lock = threading.Lock()
+            pending = [len(blob_batch)]
+            pending_lock = threading.Lock()
+            _exit_requested = [0]
+            _exit_lock = threading.Lock()
+            _threads: list[threading.Thread] = []
+            _threads_lock = threading.Lock()
+            _next_id = [1]
+            _scale_check_lock = threading.Lock()
+
+            def _spawn_workers(count: int) -> None:
+                for _ in range(count):
+                    wid = _next_id[0]
+                    _next_id[0] += 1
+                    t = threading.Thread(target=worker_loop, args=(wid,), daemon=True)
+                    with _threads_lock:
+                        _threads.append(t)
+                    t.start()
+
+            def _try_scale_check() -> None:
+                if not _scale_check_lock.acquire(blocking=False):
+                    return
+                try:
+                    if scaler is None or p95_bytes <= 0:
+                        return
+                    interval_due = self._completed_since_scale_check >= SCALER_CHECK_INTERVAL
+                    force_due = self._pending_force_scale
+                    if not (interval_due or force_due):
+                        return
+                    if not scaler.window_ready():
+                        return
+                    if interval_due:
+                        self._completed_since_scale_check = 0
+                    if force_due:
+                        self._pending_force_scale = False
+                    old_count = self._worker_count
+                    new_count, reason = scaler.should_scale(old_count, p95_bytes)
+                    if new_count != old_count:
+                        self._worker_count = new_count
+                        direction = "up" if new_count > old_count else "down"
+                        self.workers_scaled.emit(new_count, old_count, direction, reason)
+                        delta = new_count - old_count
+                        if delta > 0:
+                            with _threads_lock:
+                                actual_alive = sum(1 for t in _threads if t.is_alive())
+                            to_spawn = max(0, new_count - actual_alive)
+                            if to_spawn > 0:
+                                _spawn_workers(to_spawn)
+                        elif delta < 0:
+                            with _exit_lock:
+                                _exit_requested[0] += abs(delta)
+                finally:
+                    _scale_check_lock.release()
+
+            def worker_loop(worker_id: int) -> None:
+                client = BlobStorageClient(self._conn, self._container_name)
+                try:
+                    while True:
+                        with _exit_lock:
+                            if _exit_requested[0] > 0:
+                                _exit_requested[0] -= 1
+                                return
+                        try:
+                            blob_name = task_queue.get(block=True, timeout=0.5)
+                        except queue.Empty:
+                            with pending_lock:
+                                if pending[0] <= 0:
+                                    return
+                            continue
+
+                        self._pause_event.wait()
+                        if self._cancel_event.is_set():
+                            task_queue.put(blob_name)
+                            task_queue.task_done()
+                            return
+
+                        attempt_counter[blob_name] = attempt_counter.get(blob_name, 0) + 1
+                        result = _process_zip_once(client, blob_name)
+                        duration_tracker[blob_name] = (
+                            duration_tracker.get(blob_name, 0.0) + result.duration_ms
+                        )
+                        aggregated_duration = duration_tracker[blob_name]
+
+                        if scaler is not None:
+                            if result.upload_bytes > 0 and result.upload_seconds > 0:
+                                scaler.record_upload(result.upload_bytes, result.upload_seconds, True)
+                            elif result.status == "error":
+                                scaler.record_upload(0, 0.0, False)
+
+                        if result.status == "success":
+                            rows = getattr(result, "_rows_converted", 0)
+                            finalize_success(
+                                blob_name=blob_name, worker_id=worker_id,
+                                duration_ms=aggregated_duration, rows_converted=rows,
+                            )
+                            duration_tracker.pop(blob_name, None)
+                            with pending_lock:
+                                pending[0] -= 1
+
+                        else:
+                            short_msg = result.short_error or _first_line(result.error or "")
+                            if not result.retriable:
+                                finalize_failure(
+                                    blob_name=blob_name, worker_id=worker_id,
+                                    duration_ms=aggregated_duration,
+                                    error=result.error or short_msg,
+                                    short_error=short_msg,
+                                    suppress_trace=result.suppress_trace,
+                                    retriable=False,
+                                )
+                                duration_tracker.pop(blob_name, None)
+                                with pending_lock:
+                                    pending[0] -= 1
+                            elif attempt_counter.get(blob_name, 0) < self._max_attempts:
+                                task_queue.put(blob_name)
+                                self._completed_since_scale_check += 1
+                                self.log_message.emit(
+                                    f"Attempt {attempt_counter[blob_name]} failed "
+                                    f"(will retry): {short_msg}"
+                                )
+                            else:
+                                finalize_failure(
+                                    blob_name=blob_name, worker_id=worker_id,
+                                    duration_ms=aggregated_duration,
+                                    error=result.error or short_msg,
+                                    short_error=short_msg,
+                                    suppress_trace=result.suppress_trace,
+                                    retriable=True,
+                                )
+                                duration_tracker.pop(blob_name, None)
+                                with pending_lock:
+                                    pending[0] -= 1
+
+                        if scaler is not None:
+                            _try_scale_check()
+                        task_queue.task_done()
+                finally:
+                    client.close()
+
+            _spawn_workers(worker_total)
+            while True:
+                with _threads_lock:
+                    alive = [t for t in _threads if t.is_alive()]
+                if not alive:
+                    break
+                if self._cancel_event.is_set():
+                    break
+                # Drain file errors on the main thread for correct Qt signal delivery
+                while not error_queue.empty():
+                    try:
+                        _blob, _msg = error_queue.get_nowait()
+                        self.file_error.emit(_blob, _msg)
+                    except queue.Empty:
+                        break
+                for t in alive:
+                    t.join(timeout=0.5)
+
+            # Final drain of any errors buffered during the last tick
+            while not error_queue.empty():
+                try:
+                    _blob, _msg = error_queue.get_nowait()
+                    self.file_error.emit(_blob, _msg)
+                except queue.Empty:
+                    break
+
+            while True:
+                try:
+                    item = task_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(item, str):
+                    with next_round_lock:
+                        next_round.append(item)
+            return next_round
+
+        # Multi-pass retry loop
+        remaining = list(blob_names)
+        pass_number = 1
+        while (
+            remaining
+            and pass_number <= self._max_attempts
+            and not self._cancel_event.is_set()
+        ):
+            if pass_number > 1:
+                delay = min(2 ** (pass_number - 1), BACKOFF_MAX_S)
+                self.log_message.emit(
+                    f"Retry pass {pass_number} — {len(remaining)} file(s), "
+                    f"waiting {delay}s..."
+                )
+                if self._cancel_event.wait(timeout=float(delay)):
+                    break
+            remaining = run_pass(remaining)
+            pass_number += 1
+
+        if self._cancel_event.is_set():
+            self.cancelled.emit()
+            return
+
+        self.finished.emit({"rowCount": total_rows, "fileCount": converted_files})
