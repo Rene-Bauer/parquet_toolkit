@@ -41,6 +41,7 @@ from gui.schema_table import SchemaTable
 from gui.system_monitor_worker import SystemMonitorWorker
 from gui.workers import SchemaLoaderWorker, TransformWorker, _format_bytes
 from gui.collector_panel import CollectorPanel
+from gui.zip_panel import ZipPanel
 from parquet_transform.checkpoint import FailedList, RunCheckpoint
 
 # Derive a sensible worker cap from available RAM.
@@ -168,6 +169,10 @@ class MainWindow(QMainWindow):
         self._collector_panel = CollectorPanel()
         tabs.addTab(self._collector_panel, "Data Collector")
 
+        # --- Tab 3: ZIP → Parquet Converter ---
+        self._zip_panel = ZipPanel()
+        tabs.addTab(self._zip_panel, "ZIP → Parquet")
+
         self._build_statusbar()
 
         # Start background system monitor (runs for the whole app lifetime)
@@ -175,6 +180,9 @@ class MainWindow(QMainWindow):
         self._sys_monitor.snapshot_ready.connect(self._resources_panel.update_snapshot)
         self._sys_monitor.snapshot_ready.connect(
             self._collector_panel.resources_panel.update_snapshot
+        )
+        self._sys_monitor.snapshot_ready.connect(
+            self._zip_panel.resources_panel.update_snapshot
         )
         self._sys_monitor.start()
 
@@ -1244,6 +1252,11 @@ class MainWindow(QMainWindow):
         """
         # 1. Data Collector (lives in CollectorPanel — not auto-propagated).
         self._collector_panel.closeEvent(event)
+        if not event.isAccepted():
+            return
+
+        # 1b. ZIP → Parquet converter.
+        self._zip_panel.closeEvent(event)
         if not event.isAccepted():
             return
 

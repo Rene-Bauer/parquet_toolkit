@@ -15,3 +15,16 @@ def test_collector_panel_has_resources_panel():
     w._sys_monitor.stop()
     w._sys_monitor.wait(2000)
     w.close()
+
+
+def test_main_window_has_zip_tab():
+    """MainWindow must expose a ZipPanel as the third tab."""
+    from gui.main_window import MainWindow
+    from gui.zip_panel import ZipPanel
+
+    w = MainWindow()
+    found = any(True for _ in w.findChildren(ZipPanel))
+    w._sys_monitor.stop()
+    w._sys_monitor.wait(2000)
+    w.close()
+    assert found, "No ZipPanel found in MainWindow"
