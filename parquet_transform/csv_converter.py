@@ -59,9 +59,9 @@ def extract_csv_tables(
 def merge_tables(tables: list[pa.Table]) -> pa.Table:
     """Concatenate *tables* into a single table.
 
-    Uses PyArrow's default type promotion so that compatible schemas
+    Uses ``promote_options="permissive"`` so that compatible schemas
     (e.g. ``int32`` vs ``int64`` in the same column) are merged without
-    error.
+    error.  Incompatible types (e.g. ``string`` vs ``int64``) still raise.
 
     Args:
         tables: Non-empty list of tables to concatenate.  All tables must
