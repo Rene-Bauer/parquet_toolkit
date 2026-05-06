@@ -59,24 +59,30 @@ def extract_csv_tables(
 def merge_tables(tables: list[pa.Table]) -> pa.Table:
     """Concatenate *tables* into a single table.
 
+    Uses PyArrow's default type promotion so that compatible schemas
+    (e.g. ``int32`` vs ``int64`` in the same column) are merged without
+    error.
+
+    Args:
+        tables: Non-empty list of tables to concatenate.  All tables must
+            have the same column names; types are promoted where compatible.
+
     Raises:
-        ValueError: Tables have incompatible schemas.
-        pa.ArrowInvalid: PyArrow cannot reconcile column types.
+        ValueError: *tables* is empty.
+        pa.ArrowInvalid: PyArrow cannot reconcile column types or names.
     """
     if not tables:
         raise ValueError("merge_tables called with an empty list")
     if len(tables) == 1:
         return tables[0]
-
-    first_schema = tables[0].schema
+    first_names = tables[0].schema.names
     for i, t in enumerate(tables[1:], 1):
-        if not t.schema.equals(first_schema):
-            raise ValueError(
-                f"Cannot merge: CSV #{i} schema differs from CSV #0.\n"
-                f"  CSV #0 : {first_schema}\n"
-                f"  CSV #{i}: {t.schema}"
+        if t.schema.names != first_names:
+            raise pa.lib.ArrowInvalid(
+                f"Cannot merge: table #{i} has columns {t.schema.names!r} "
+                f"but table #0 has columns {first_names!r}"
             )
-    return pa.concat_tables(tables)
+    return pa.concat_tables(tables, promote_options="default")
 
 
 def compute_zip_output_name(
@@ -106,6 +112,11 @@ def compute_zip_output_name(
     """
     norm_src_prefix = source_prefix.rstrip("/") + "/"
     norm_out_prefix = output_prefix.rstrip("/")
+
+    if not source_blob.lower().endswith(".zip"):
+        raise ValueError(
+            f"compute_zip_output_name: source_blob must end with '.zip', got {source_blob!r}"
+        )
 
     if source_blob.startswith(norm_src_prefix):
         relative = source_blob[len(norm_src_prefix):]

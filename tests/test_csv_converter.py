@@ -45,7 +45,8 @@ def test_extract_ignores_non_csv_entries():
 
 def test_extract_empty_zip_returns_empty_list():
     buf = io.BytesIO()
-    zipfile.ZipFile(buf, "w").close()
+    with zipfile.ZipFile(buf, "w"):
+        pass
     tables = extract_csv_tables(buf.getvalue())
     assert tables == []
 
@@ -83,8 +84,13 @@ def test_merge_compatible_tables():
 def test_merge_incompatible_raises():
     t1 = pa.table({"id": [1]})
     t2 = pa.table({"name": ["x"]})
-    with pytest.raises((ValueError, pa.ArrowInvalid)):
+    with pytest.raises(pa.ArrowInvalid):
         merge_tables([t1, t2])
+
+
+def test_merge_empty_list_raises():
+    with pytest.raises(ValueError, match="empty"):
+        merge_tables([])
 
 
 def test_compute_zip_output_name_strips_prefix_and_changes_ext():
