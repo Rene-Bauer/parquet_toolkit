@@ -75,14 +75,15 @@ def merge_tables(tables: list[pa.Table]) -> pa.Table:
         raise ValueError("merge_tables called with an empty list")
     if len(tables) == 1:
         return tables[0]
-    first_names = tables[0].schema.names
+    first_names = set(tables[0].schema.names)
     for i, t in enumerate(tables[1:], 1):
-        if t.schema.names != first_names:
+        if set(t.schema.names) != first_names:
             raise pa.lib.ArrowInvalid(
-                f"Cannot merge: table #{i} has columns {t.schema.names!r} "
-                f"but table #0 has columns {first_names!r}"
+                f"Cannot merge: CSV #{i} has a different column set than CSV #0.\n"
+                f"  CSV #0 columns: {sorted(first_names)}\n"
+                f"  CSV #{i} columns: {sorted(t.schema.names)}"
             )
-    return pa.concat_tables(tables, promote_options="default")
+    return pa.concat_tables(tables, promote_options="permissive")
 
 
 def compute_zip_output_name(
@@ -123,5 +124,5 @@ def compute_zip_output_name(
     else:
         relative = source_blob
 
-    base = relative[:-4] if relative.lower().endswith(".zip") else relative
+    base = relative[:-4]  # .zip suffix guaranteed by the guard above
     return f"{norm_out_prefix}/{base}.parquet"

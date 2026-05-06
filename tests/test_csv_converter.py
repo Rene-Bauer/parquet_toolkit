@@ -116,3 +116,24 @@ def test_compute_zip_output_name_trailing_slash_normalised():
     r1 = compute_zip_output_name("arc/f.zip", "arc/", "out/")
     r2 = compute_zip_output_name("arc/f.zip", "arc",  "out")
     assert r1 == r2
+
+
+def test_compute_zip_output_name_non_zip_raises():
+    with pytest.raises(ValueError, match=r"\.zip"):
+        compute_zip_output_name("archive/data.csv", "archive/", "out/")
+
+
+def test_merge_promotes_compatible_types():
+    """int32 + int64 in same column must merge without error."""
+    t1 = pa.table({"id": pa.array([1], type=pa.int32())})
+    t2 = pa.table({"id": pa.array([2], type=pa.int64())})
+    merged = merge_tables([t1, t2])
+    assert merged.num_rows == 2
+
+
+def test_merge_same_columns_different_order_is_allowed():
+    """Same column set, different order: concat_tables should handle reordering."""
+    t1 = pa.table({"a": [1], "b": ["x"]})
+    t2 = pa.table({"b": ["y"], "a": [2]})
+    merged = merge_tables([t1, t2])
+    assert merged.num_rows == 2
