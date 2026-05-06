@@ -1256,6 +1256,8 @@ class MainWindow(QMainWindow):
             return
 
         # 1b. ZIP → Parquet converter.
+        #     Guard mirrors the collector so adding a cancel-prompt to ZipPanel
+        #     in the future will automatically be respected here.
         self._zip_panel.closeEvent(event)
         if not event.isAccepted():
             return
