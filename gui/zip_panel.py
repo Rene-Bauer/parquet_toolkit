@@ -529,4 +529,5 @@ class ZipPanel(QWidget):
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(5_000)
+        self._request_worker_cleanup(force=True)
         super().closeEvent(event)
