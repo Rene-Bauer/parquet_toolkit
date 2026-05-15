@@ -117,14 +117,8 @@ def binary16_to_uuid(array: pa.Array, params: dict) -> pa.Array:
     if isinstance(arr_type, pa.ExtensionType):
         if hasattr(array, "storage"):
             return binary16_to_uuid(array.storage, params)
-        # Extension without .storage — try a direct cast as last resort
-        try:
-            return array.cast(_UUID_STRING_TYPE, safe=False)
-        except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as exc:
-            raise ValueError(
-                f"binary16_to_uuid: cannot convert extension type {arr_type} to "
-                f"string. Detail: {exc}"
-            ) from exc
+        # Extension without .storage — fall through to the generic path below
+        pass
 
     # ── fixed_size_binary[16] — standard UUID byte layout ───────────────────
     if pa_types.is_fixed_size_binary(arr_type) and arr_type.byte_width == 16:
@@ -138,14 +132,18 @@ def binary16_to_uuid(array: pa.Array, params: dict) -> pa.Array:
         return pa.array(results, type=_UUID_STRING_TYPE)
 
     # ── Generic fallback: cast whatever type is present to string ────────────
+    # Level 1: Arrow-native cast (fast, zero-copy for many types)
     try:
         return array.cast(_UUID_STRING_TYPE, safe=False)
-    except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as exc:
-        raise ValueError(
-            f"binary16_to_uuid: cannot convert {arr_type} to string. "
-            f"Supported: fixed_size_binary[16], extension<arrow.uuid>, string-like. "
-            f"Detail: {exc}"
-        ) from exc
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+        pass
+
+    # Level 2: element-by-element Python str() — works for literally any type
+    results: list[str | None] = [
+        None if item.as_py() is None else str(item.as_py())
+        for item in array
+    ]
+    return pa.array(results, type=_UUID_STRING_TYPE)
 
 
 @register(

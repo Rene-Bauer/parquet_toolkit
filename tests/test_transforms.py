@@ -197,6 +197,22 @@ class TestBinary16ToUuid:
         assert result.type == pa.string()
         assert result[0].as_py() == uid
 
+    def test_integer_input_falls_back_to_str_representation(self):
+        """Any castable type (e.g. int64) must not raise — produces str digits."""
+        array = pa.array([42, None, 7], type=pa.int64())
+        result = tr.binary16_to_uuid(array, params={})
+        assert result.type == pa.string()
+        assert result[0].as_py() == "42"
+        assert result[1].as_py() is None
+        assert result[2].as_py() == "7"
+
+    def test_bool_input_falls_back_gracefully(self):
+        """Boolean values are converted to their string representation."""
+        array = pa.array([True, False, None], type=pa.bool_())
+        result = tr.binary16_to_uuid(array, params={})
+        assert result.type == pa.string()
+        assert result[2].as_py() is None
+
 
 # ---------------------------------------------------------------------------
 # timestamp_ns_to_ms_utc
