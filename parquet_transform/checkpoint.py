@@ -15,7 +15,6 @@ import json
 import os
 import re
 import threading
-import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -33,39 +32,55 @@ def _sanitize_key(container: str, prefix: str) -> str:
     return f"{c}__{p}__{digest}"
 
 
+# ---------------------------------------------------------------------------
+# Per-path write serialisation
+# ---------------------------------------------------------------------------
+# On Windows, os.replace(tmp, target) raises PermissionError when another
+# thread is mid-replace on the *same* target, even when each thread uses a
+# uniquely-named .tmp file.  A retry loop is not sufficient because the
+# competing thread may still be holding the file handle throughout the wait.
+#
+# Solution: a module-level dict maps each target Path to a dedicated Lock.
+# Every call to _atomic_write acquires that lock first, so only one thread
+# ever executes the write+replace for a given file at a time — regardless of
+# how many RunCheckpoint / ArchiveCheckpoint instances exist.
+
+_PATH_WRITE_LOCKS: dict[Path, threading.Lock] = {}
+_PATH_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def _get_path_lock(path: Path) -> threading.Lock:
+    with _PATH_WRITE_LOCKS_GUARD:
+        if path not in _PATH_WRITE_LOCKS:
+            _PATH_WRITE_LOCKS[path] = threading.Lock()
+        return _PATH_WRITE_LOCKS[path]
+
+
 def _atomic_write(path: Path, data: dict) -> None:
     """Write *data* as JSON to *path* atomically via a uniquely-named sibling .tmp file.
 
-    Each call generates a fresh UUID-based temp name so concurrent writers
-    (multiple RunCheckpoint instances pointing at the same file) never
-    clobber each other's buffer before the rename completes.
+    Thread-safe across all instances: a module-level per-path lock ensures
+    that only one thread executes the write+replace for a given file at a time.
+    This prevents the PermissionError that Windows raises when two threads
+    attempt os.replace() onto the same target concurrently.
 
-    On Windows, ``os.replace`` can fail with PermissionError when the
-    target file is briefly locked by another thread's concurrent rename or
-    by an antivirus scan.  We retry up to 5 times with exponential back-off
-    (50 ms → 800 ms) before propagating the error.  The temp file is
-    cleaned up on failure so no orphaned .tmp files accumulate.
+    The temp file is cleaned up on any failure so no orphaned .tmp files
+    accumulate even if the process is interrupted.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.parent / f".{path.stem}_{uuid.uuid4().hex[:8]}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        last_exc: BaseException | None = None
-        for attempt in range(5):
-            try:
-                os.replace(tmp, path)
-                return  # success — tmp is now path, no cleanup needed
-            except PermissionError as exc:
-                last_exc = exc
-                time.sleep(0.05 * (2 ** attempt))  # 50 ms, 100 ms, 200 ms, 400 ms, 800 ms
-        raise last_exc  # type: ignore[misc]
-    except Exception:
+    lock = _get_path_lock(path)
+    with lock:
+        tmp = path.parent / f".{path.stem}_{uuid.uuid4().hex[:8]}.tmp"
         try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
 
 def _now() -> str:
