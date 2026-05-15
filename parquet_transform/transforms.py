@@ -57,13 +57,22 @@ def get_suggested(arrow_type: pa.DataType) -> str | None:
     """
     Return the registry key of the best matching transform for the given
     Arrow type, or None if no auto-suggestion exists.
+
+    Extension types (e.g. extension<arrow.uuid>) are matched both by their
+    full string representation and by their extension_name so the pattern
+    "arrow.uuid" hits without needing to embed "extension<...>" in every rule.
     """
     type_str = str(arrow_type)
+    # For extension types also expose the bare extension name for pattern matching
+    extension_name = getattr(arrow_type, "extension_name", None)
+
     for key, (_, _, applicable_types) in _REGISTRY.items():
         if applicable_types is None:
             continue
         for pattern in applicable_types:
             if pattern in type_str:
+                return key
+            if extension_name and pattern in extension_name:
                 return key
     return None
 
@@ -75,36 +84,68 @@ def get_suggested(arrow_type: pa.DataType) -> str | None:
 @register(
     "binary16_to_uuid",
     "→ String (UUID-Format)",
-    applicable_types=["fixed_size_binary[16]"],
+    applicable_types=["fixed_size_binary[16]", "arrow.uuid", "extension"],
 )
 def binary16_to_uuid(array: pa.Array, params: dict) -> pa.Array:
     """
-    Convert fixed_size_binary[16] to plain UTF-8 string in UUID format
+    Convert any UUID-like column to plain UTF-8 string in UUID format
     "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
+
+    Handled input types (in order):
+      • pa.string() / pa.large_string()     — returned as-is / cast
+      • extension<arrow.uuid>               — unwrap storage → byte conversion
+      • any other extension type            — unwrap storage and recurse
+      • fixed_size_binary[16]               — byte-level UUID conversion
+      • anything else                       — attempt pa.cast to string
 
     Output type: pa.string() = Arrow utf8
     Parquet encoding: BYTE_ARRAY with STRING/UTF8 logical annotation
     Spark type: StringType — natively readable by Databricks Autoloader.
     """
     arr_type = array.type
+
+    # ── Already a string type ────────────────────────────────────────────────
     if pa_types.is_string(arr_type):
         return array
     if pa_types.is_large_string(arr_type):
         return array.cast(_UUID_STRING_TYPE, safe=False)
-    if not (pa_types.is_fixed_size_binary(arr_type) and arr_type.byte_width == 16):
-        raise ValueError(
-            "binary16_to_uuid expects fixed_size_binary[16] or string-like input; "
-            f"got {arr_type}"
-        )
 
-    results: list[str | None] = []
-    for item in array:
-        if item is None or item.as_py() is None:
-            results.append(None)
-        else:
-            raw: bytes = item.as_py()
-            results.append(str(uuid.UUID(bytes=raw)))
-    return pa.array(results, type=_UUID_STRING_TYPE)
+    # ── Arrow extension types (e.g. extension<arrow.uuid>) ───────────────────
+    # PyArrow stores extension<arrow.uuid> as fixed_size_binary[16] underneath.
+    # Unwrap the storage array and recurse so all subsequent logic applies.
+    # pa_types has no is_extension(); use isinstance against pa.ExtensionType.
+    if isinstance(arr_type, pa.ExtensionType):
+        if hasattr(array, "storage"):
+            return binary16_to_uuid(array.storage, params)
+        # Extension without .storage — try a direct cast as last resort
+        try:
+            return array.cast(_UUID_STRING_TYPE, safe=False)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as exc:
+            raise ValueError(
+                f"binary16_to_uuid: cannot convert extension type {arr_type} to "
+                f"string. Detail: {exc}"
+            ) from exc
+
+    # ── fixed_size_binary[16] — standard UUID byte layout ───────────────────
+    if pa_types.is_fixed_size_binary(arr_type) and arr_type.byte_width == 16:
+        results: list[str | None] = []
+        for item in array:
+            if item is None or item.as_py() is None:
+                results.append(None)
+            else:
+                raw: bytes = item.as_py()
+                results.append(str(uuid.UUID(bytes=raw)))
+        return pa.array(results, type=_UUID_STRING_TYPE)
+
+    # ── Generic fallback: cast whatever type is present to string ────────────
+    try:
+        return array.cast(_UUID_STRING_TYPE, safe=False)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as exc:
+        raise ValueError(
+            f"binary16_to_uuid: cannot convert {arr_type} to string. "
+            f"Supported: fixed_size_binary[16], extension<arrow.uuid>, string-like. "
+            f"Detail: {exc}"
+        ) from exc
 
 
 @register(

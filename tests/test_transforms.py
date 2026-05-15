@@ -8,6 +8,44 @@ import parquet_transform.transforms as tr
 
 
 # ---------------------------------------------------------------------------
+# Helper: build an extension<arrow.uuid> type and array
+# ---------------------------------------------------------------------------
+
+class _ArrowUUIDType(pa.ExtensionType):
+    """Minimal replica of the arrow.uuid extension type used by external tools
+    (Spark, DuckDB, etc.) that write Parquet with extension<arrow.uuid> columns.
+    Storage type is fixed_size_binary[16] with standard RFC-4122 byte order.
+    """
+    def __init__(self) -> None:
+        super().__init__(pa.binary(16), "arrow.uuid")
+
+    def __arrow_ext_serialize__(self) -> bytes:
+        return b""
+
+    @classmethod
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):  # noqa: ANN
+        return cls()
+
+
+try:
+    pa.register_extension_type(_ArrowUUIDType())
+except pa.lib.ArrowKeyError:
+    pass  # already registered (e.g. when pytest re-imports the module)
+
+_ARROW_UUID_TYPE = _ArrowUUIDType()
+
+
+def _make_uuid_extension_array(values: list[str | None]) -> pa.Array:
+    """Create an extension<arrow.uuid> array from a list of UUID strings / None."""
+    raw: list[bytes | None] = [
+        uuid.UUID(v).bytes if v is not None else None
+        for v in values
+    ]
+    storage = pa.array(raw, type=pa.binary(16))
+    return pa.ExtensionArray.from_storage(_ARROW_UUID_TYPE, storage)
+
+
+# ---------------------------------------------------------------------------
 # Registry mechanics
 # ---------------------------------------------------------------------------
 
@@ -68,6 +106,10 @@ class TestGetSuggested:
         result = tr.get_suggested(pa.utf8())
         assert result is None
 
+    def test_suggests_binary16_to_uuid_for_extension_uuid(self):
+        result = tr.get_suggested(_ARROW_UUID_TYPE)   # extension<arrow.uuid>
+        assert result == "binary16_to_uuid"
+
 
 # ---------------------------------------------------------------------------
 # binary16_to_uuid
@@ -109,6 +151,51 @@ class TestBinary16ToUuid:
         raw_list = [uuid.UUID(u).bytes for u in ids]
         result = tr.binary16_to_uuid(self._make_array(raw_list), params={})
         assert [v.as_py() for v in result] == ids
+
+    # --- extension<arrow.uuid> input (the "unknown type" from production) ---
+
+    def test_extension_uuid_type_is_converted(self):
+        """extension<arrow.uuid> must produce the same string output as binary16."""
+        uid = "12345678-1234-5678-1234-567812345678"
+        array = _make_uuid_extension_array([uid])
+        result = tr.binary16_to_uuid(array, params={})
+        assert result.type == pa.string()
+        assert result[0].as_py() == uid
+
+    def test_extension_uuid_null_preserved(self):
+        array = _make_uuid_extension_array([None])
+        result = tr.binary16_to_uuid(array, params={})
+        assert result[0].as_py() is None
+
+    def test_extension_uuid_mixed_none_and_values(self):
+        uid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        array = _make_uuid_extension_array([None, uid])
+        result = tr.binary16_to_uuid(array, params={})
+        assert result[0].as_py() is None
+        assert result[1].as_py() == uid
+
+    def test_extension_uuid_multiple_values(self):
+        ids = [
+            "12345678-1234-5678-1234-567812345678",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        ]
+        array = _make_uuid_extension_array(ids)
+        result = tr.binary16_to_uuid(array, params={})
+        assert [v.as_py() for v in result] == ids
+
+    def test_string_input_is_returned_unchanged(self):
+        uid = "12345678-1234-5678-1234-567812345678"
+        array = pa.array([uid], type=pa.string())
+        result = tr.binary16_to_uuid(array, params={})
+        assert result.type == pa.string()
+        assert result[0].as_py() == uid
+
+    def test_large_string_input_is_cast_to_string(self):
+        uid = "12345678-1234-5678-1234-567812345678"
+        array = pa.array([uid], type=pa.large_utf8())
+        result = tr.binary16_to_uuid(array, params={})
+        assert result.type == pa.string()
+        assert result[0].as_py() == uid
 
 
 # ---------------------------------------------------------------------------
