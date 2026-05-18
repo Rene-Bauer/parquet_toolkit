@@ -402,6 +402,7 @@ class TransformWorker(QThread):
         checkpoint: RunCheckpoint | None = None,
         failed_list: FailedList | None = None,
         retry_failed: bool = False,
+        debug_logging: bool = False,
         parent=None,
     ):
         super().__init__(parent)
@@ -421,6 +422,7 @@ class TransformWorker(QThread):
         self._checkpoint = checkpoint
         self._failed_list = failed_list
         self._retry_failed = retry_failed
+        self._debug_logging = debug_logging
         self._cancel_event = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()
@@ -571,7 +573,7 @@ class TransformWorker(QThread):
             if first_real_trigger:
                 self.log_message.emit("[Autoscale WARN] First transformed file detected — forcing scale check")
 
-            if timing_detail and not skipped:
+            if self._debug_logging and timing_detail and not skipped:
                 short_name = blob_name.split("/")[-1]
                 self.log_message.emit(
                     f"[Timing] W{worker_id} {short_name} ({duration_ms:.0f}ms total) — {timing_detail}"

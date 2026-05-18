@@ -315,6 +315,15 @@ class MainWindow(QMainWindow):
         self._autoscale_check.toggled.connect(self._on_autoscale_toggled)
         self._autoscale_check.setChecked(True)  # fires toggled(True) → slot disables spinner
 
+        self._debug_log_check = QCheckBox("Debug-Logging")
+        self._debug_log_check.setToolTip(
+            "Log per-step timing for each file:\n"
+            "dl= download  rd= parquet read  tr= transform  wr= parquet write  up= upload\n"
+            "Use this to identify where processing time is spent.\n"
+            "Disable for production runs to reduce log noise."
+        )
+        self._debug_log_check.setChecked(False)
+
         attempts_label = QLabel("Attempts:")
         attempts_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
         self._attempts_spin = QSpinBox()
@@ -365,6 +374,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._worker_spin)
         layout.addWidget(self._max_workers_label)
         layout.addWidget(self._autoscale_check)
+        layout.addWidget(self._debug_log_check)
         layout.addSpacing(12)
         layout.addWidget(attempts_label)
         layout.addWidget(self._attempts_spin)
@@ -943,6 +953,7 @@ class MainWindow(QMainWindow):
             checkpoint=checkpoint,
             failed_list=failed_list,
             retry_failed=retry_failed,
+            debug_logging=self._debug_log_check.isChecked(),
         )
         self._transform_worker.listing_complete.connect(self._on_listing_complete)
         self._transform_worker.progress.connect(self._on_transform_progress)
