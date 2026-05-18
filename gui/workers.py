@@ -40,6 +40,11 @@ try:
 except (ImportError, AttributeError):
     _ARROW_EXCEPTIONS = ()
 
+try:
+    import psutil as _psutil
+except ImportError:  # pragma: no cover
+    _psutil = None  # type: ignore[assignment]
+
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -130,6 +135,19 @@ N_opt (Phase C) are considered to *agree*.  When they agree the USL ceiling is
 enforced; when they disagree the more conservative of the two is used and the
 scaler adds only one worker at a time until they converge.  0.20 = within 20%."""
 
+OOM_WORKER_EXIT_MB: int = 512
+"""Available-RAM threshold for proactive worker self-exit.
+
+Before pulling each new task a worker checks ``psutil.virtual_memory().available``.
+If available RAM is below this many MiB the worker exits voluntarily — leaving the
+file in the queue for the remaining (now fewer) threads — rather than risking a
+hard ``MemoryError`` or process freeze from PyArrow's C++ allocator.
+
+On a reactive OOM (``MemoryError`` raised by PyArrow mid-read) the worker that
+hit the error additionally requests half the current workers to exit so that
+subsequent files get more address space.
+"""
+
 
 _EXPECTED_OUTPUT_TYPES: dict[str, pa.DataType] = {
     "binary16_to_uuid": pa.string(),
@@ -178,6 +196,7 @@ class _FileResult:
     upload_bytes: int = 0       # > 0 only on successful upload (for calibration)
     upload_seconds: float = 0.0 # wall-clock seconds for the upload step only
     rows_converted: int = 0     # populated by ZipConverterWorker on success
+    oom: bool = False           # True when PyArrow raised MemoryError mid-read
 
 
 def _first_line(text: str) -> str:
@@ -678,6 +697,20 @@ class TransformWorker(QThread):
                                 _exit_requested[0] -= 1
                                 return
 
+                        # ── Proactive OOM guard ──────────────────────────────────────
+                        # If available RAM drops below the threshold we exit voluntarily
+                        # rather than risk a PyArrow MemoryError (or worse, a C++ freeze)
+                        # on the next download.  The file stays in the queue.
+                        if _psutil is not None:
+                            _avail_mb = _psutil.virtual_memory().available / (1024 * 1024)
+                            if _avail_mb < OOM_WORKER_EXIT_MB:
+                                self.log_message.emit(
+                                    f"[OOM] Worker {worker_id} exiting proactively: "
+                                    f"{_avail_mb:.0f} MB available < "
+                                    f"{OOM_WORKER_EXIT_MB} MB threshold"
+                                )
+                                return
+
                         # ── Pull next task (short timeout so exit check re-runs) ───
                         try:
                             item = task_queue.get(block=True, timeout=0.5)
@@ -737,6 +770,24 @@ class TransformWorker(QThread):
                         else:
                             error_text = result.error or "Unknown error"
                             short_msg  = result.short_error or _first_line(error_text)
+
+                            # ── Reactive OOM scale-down ──────────────────────────
+                            # When PyArrow hits a MemoryError mid-read we immediately
+                            # request half of the current workers to exit so subsequent
+                            # files get more address space.  The file will be re-queued
+                            # by the normal retriable path below.
+                            if result.oom:
+                                with _exit_lock:
+                                    _oom_target = max(1, self._worker_count // 2)
+                                    _oom_reduction = self._worker_count - _oom_target
+                                    if _oom_reduction > 0:
+                                        _exit_requested[0] += _oom_reduction
+                                if _oom_reduction > 0:
+                                    self.log_message.emit(
+                                        f"[OOM] MemoryError on {blob_name!r} — "
+                                        f"requesting {_oom_reduction} worker(s) to exit "
+                                        f"(target: {_oom_target})"
+                                    )
 
                             if result.suppress_trace:
                                 with conn_error_lock:
@@ -990,6 +1041,21 @@ class TransformWorker(QThread):
                 duration_ms=(perf_counter() - file_start) * 1000.0,
                 upload_bytes=upload_bytes,
                 upload_seconds=upload_seconds,
+            )
+        except MemoryError as exc:
+            # PyArrow's C++ allocator can raise MemoryError (or freeze) when
+            # decompressing heavily-compressed files.  We surface this as a
+            # retriable, trace-suppressed error so the retry loop re-queues
+            # the file and the OOM scale-down logic can reduce concurrency.
+            msg = str(exc).strip() or "realloc failed"
+            return _FileResult(
+                status="error",
+                duration_ms=(perf_counter() - file_start) * 1000.0,
+                error=f"MemoryError: {msg}",
+                short_error=f"Out of memory processing file ({msg})",
+                suppress_trace=True,
+                retriable=True,
+                oom=True,
             )
         except Exception as exc:
             short_error, suppress_trace, retriable = _summarize_exception(exc)
