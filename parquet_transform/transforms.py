@@ -11,6 +11,7 @@ from __future__ import annotations
 import uuid
 from typing import Callable
 
+import numpy as np
 import pyarrow as pa
 from pyarrow import types as pa_types
 
@@ -78,6 +79,78 @@ def get_suggested(arrow_type: pa.DataType) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+_HEX_CHARS = np.frombuffer(b"0123456789abcdef", dtype=np.uint8)
+
+
+def _fixed_binary16_to_uuid_strings(array: pa.Array) -> pa.Array:
+    """Convert a fixed_size_binary[16] PyArrow array to UUID strings.
+
+    Uses numpy for the hex-encoding step so that the heavy work runs in C
+    and releases the GIL — keeping the Qt main thread responsive when many
+    parallel worker threads call this simultaneously.
+
+    Output type: pa.string()  (UTF-8, UUID canonical format with dashes)
+    """
+    # table.column() always returns a ChunkedArray — combine into a single
+    # contiguous Array so we can take a zero-copy numpy view of the buffer.
+    if isinstance(array, pa.ChunkedArray):
+        array = array.combine_chunks()
+
+    n = len(array)
+    if n == 0:
+        return pa.array([], type=_UUID_STRING_TYPE)
+
+    # Zero-copy view of the raw byte buffer, accounting for slice offsets.
+    buf = array.buffers()[1]
+    offset = array.offset
+    raw = np.frombuffer(buf, dtype=np.uint8)[offset * 16:(offset + n) * 16]
+    raw = raw.reshape(n, 16)  # (N, 16) — each row is one UUID
+
+    # Vectorised hex encoding in C (GIL released by numpy).
+    hi = _HEX_CHARS[raw >> 4]   # high nibbles  → (N, 16) ASCII bytes
+    lo = _HEX_CHARS[raw & 0x0F] # low nibbles   → (N, 16) ASCII bytes
+
+    # Interleave hi/lo into (N, 32) hex-char array.
+    hex32 = np.empty((n, 32), dtype=np.uint8)
+    hex32[:, 0::2] = hi
+    hex32[:, 1::2] = lo
+
+    # Insert dashes: UUID layout is 8-4-4-4-12 hex chars.
+    dash = ord("-")
+    uuid36 = np.empty((n, 36), dtype=np.uint8)
+    uuid36[:, :8]  = hex32[:, :8]
+    uuid36[:, 8]   = dash
+    uuid36[:, 9:13]  = hex32[:, 8:12]
+    uuid36[:, 13]  = dash
+    uuid36[:, 14:18] = hex32[:, 12:16]
+    uuid36[:, 18]  = dash
+    uuid36[:, 19:23] = hex32[:, 16:20]
+    uuid36[:, 23]  = dash
+    uuid36[:, 24:]   = hex32[:, 20:]
+
+    # Convert each 36-byte row to a Python str — tobytes()+decode is C-level.
+    uuid_bytes = uuid36.tobytes()  # flat bytes, length N*36
+    strings: list[str | None] = [
+        uuid_bytes[i * 36:(i + 1) * 36].decode("ascii")
+        for i in range(n)
+    ]
+
+    # Re-apply null mask if the array has nulls.
+    if array.null_count > 0:
+        null_buf = array.buffers()[0]
+        null_bytes = np.frombuffer(null_buf, dtype=np.uint8)
+        for i in range(n):
+            abs_i = offset + i
+            if not (null_bytes[abs_i >> 3] >> (abs_i & 7)) & 1:
+                strings[i] = None
+
+    return pa.array(strings, type=_UUID_STRING_TYPE)
+
+
+# ---------------------------------------------------------------------------
 # Built-in transforms
 # ---------------------------------------------------------------------------
 
@@ -128,15 +201,10 @@ def binary16_to_uuid(array: pa.Array, params: dict) -> pa.Array:
         pass
 
     # ── fixed_size_binary[16] — standard UUID byte layout ───────────────────
+    # Vectorised via numpy so the hex-encoding step runs in C and releases
+    # the GIL, keeping the Qt main thread responsive under heavy parallelism.
     if pa_types.is_fixed_size_binary(arr_type) and arr_type.byte_width == 16:
-        results: list[str | None] = []
-        for item in array:
-            if item is None or item.as_py() is None:
-                results.append(None)
-            else:
-                raw: bytes = item.as_py()
-                results.append(str(uuid.UUID(bytes=raw)))
-        return pa.array(results, type=_UUID_STRING_TYPE)
+        return _fixed_binary16_to_uuid_strings(array)
 
     # ── Generic fallback: cast whatever type is present to string ────────────
     # Level 1: Arrow-native cast (fast, zero-copy for many types)

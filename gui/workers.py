@@ -1048,7 +1048,7 @@ class TransformWorker(QThread):
             upload_seconds = 0.0
             if not self._dry_run:
                 out_buf = io.BytesIO()
-                pq.write_table(table, out_buf, compression="zstd", compression_level=3)
+                pq.write_table(table, out_buf, compression="zstd", compression_level=1)
                 upload_data = out_buf.getvalue()
                 t_upload = perf_counter()
                 client.upload_bytes(output_name, upload_data,
@@ -1503,7 +1503,7 @@ class DataCollectorWorker(QThread):
                             writer_schema[0] = chunk.schema
                             writer_ref[0] = pq.ParquetWriter(
                                 tmp1_ref[0], chunk.schema,
-                                compression="zstd", compression_level=3,
+                                compression="zstd", compression_level=1,
                             )
                         # If this chunk's schema differs from the writer schema
                         # (e.g. mixed timestamp[ns] / timestamp[ms,UTC] sources),
@@ -2010,7 +2010,7 @@ class ZipConverterWorker(QThread):
 
                 fd, tmp_path = tempfile.mkstemp(suffix=".parquet", prefix="zipconv_")
                 _os.close(fd)
-                pq.write_table(merged, tmp_path, compression="zstd", compression_level=3)
+                pq.write_table(merged, tmp_path, compression="zstd", compression_level=1)
 
                 t_upload = perf_counter()
                 _upload_verify_with_retry(
