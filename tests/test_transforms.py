@@ -155,12 +155,32 @@ class TestBinary16ToUuid:
     # --- extension<arrow.uuid> input (the "unknown type" from production) ---
 
     def test_extension_uuid_type_is_converted(self):
-        """extension<arrow.uuid> must produce the same string output as binary16."""
+        """Plain ExtensionArray: extension<arrow.uuid> → UUID string."""
         uid = "12345678-1234-5678-1234-567812345678"
         array = _make_uuid_extension_array([uid])
         result = tr.binary16_to_uuid(array, params={})
         assert result.type == pa.string()
         assert result[0].as_py() == uid
+
+    def test_extension_uuid_chunked_array_is_converted(self):
+        """ChunkedArray of extension<arrow.uuid> (as returned by table.column()).
+
+        This is the most common production code path: apply_transforms receives
+        table.column('Id') which is always a ChunkedArray, never a plain Array.
+        """
+        import pyarrow.parquet as pq
+        uid = "12345678-1234-5678-1234-567812345678"
+        array = _make_uuid_extension_array([uid, None])
+        table = pa.table({"Id": array})
+        buf = pa.BufferOutputStream()
+        pq.write_table(table, buf)
+        table2 = pq.read_table(pa.BufferReader(buf.getvalue()))
+        col = table2.column("Id")   # ChunkedArray
+        assert isinstance(col, pa.ChunkedArray), "precondition: must be ChunkedArray"
+        result = tr.binary16_to_uuid(col, params={})
+        assert result.type == pa.string()
+        assert result[0].as_py() == uid
+        assert result[1].as_py() is None
 
     def test_extension_uuid_null_preserved(self):
         array = _make_uuid_extension_array([None])

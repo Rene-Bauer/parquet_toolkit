@@ -112,12 +112,19 @@ def binary16_to_uuid(array: pa.Array, params: dict) -> pa.Array:
 
     # ── Arrow extension types (e.g. extension<arrow.uuid>) ───────────────────
     # PyArrow stores extension<arrow.uuid> as fixed_size_binary[16] underneath.
-    # Unwrap the storage array and recurse so all subsequent logic applies.
-    # pa_types has no is_extension(); use isinstance against pa.ExtensionType.
+    # Unwrap to storage and recurse so all subsequent logic applies.
+    #
+    # Key subtlety: table.column() returns a ChunkedArray, which does NOT have
+    # a .storage attribute — only a plain ExtensionArray has it.  We must call
+    # combine_chunks() first to collapse the ChunkedArray into one ExtensionArray.
     if isinstance(arr_type, pa.ExtensionType):
+        # ChunkedArray path (most common — table.column() always returns this)
+        if isinstance(array, pa.ChunkedArray):
+            return binary16_to_uuid(array.combine_chunks(), params)
+        # Plain ExtensionArray path
         if hasattr(array, "storage"):
             return binary16_to_uuid(array.storage, params)
-        # Extension without .storage — fall through to the generic path below
+        # Extension without accessible storage — fall through to generic path
         pass
 
     # ── fixed_size_binary[16] — standard UUID byte layout ───────────────────
