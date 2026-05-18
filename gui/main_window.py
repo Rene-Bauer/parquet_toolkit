@@ -17,7 +17,10 @@ from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -335,6 +338,14 @@ class MainWindow(QMainWindow):
         self._failed_btn.setEnabled(False)
         self._failed_btn.clicked.connect(self._on_process_failed)
 
+        self._clear_cp_btn = QPushButton("Clear Checkpoint…")
+        self._clear_cp_btn.setFixedWidth(145)
+        self._clear_cp_btn.setToolTip(
+            "Delete the checkpoint and failed-list files for a given\n"
+            "container + prefix so the next run starts completely fresh."
+        )
+        self._clear_cp_btn.clicked.connect(self._on_clear_checkpoint)
+
         self._apply_btn = QPushButton("Apply to All Files")
         self._apply_btn.setFixedWidth(150)
         self._apply_btn.clicked.connect(lambda: self._on_apply(dry_run=False))
@@ -360,6 +371,7 @@ class MainWindow(QMainWindow):
         layout.addSpacing(12)
         layout.addWidget(self._dryrun_btn)
         layout.addWidget(self._failed_btn)
+        layout.addWidget(self._clear_cp_btn)
         layout.addStretch()
         layout.addWidget(self._apply_btn)
         layout.addWidget(self._pause_btn)
@@ -649,6 +661,71 @@ class MainWindow(QMainWindow):
             blob_names=fl.blob_names(),
             failed_list=fl,
         )
+
+    def _on_clear_checkpoint(self) -> None:
+        """Open a dialog to delete checkpoint + failed-list files for any container/prefix."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Clear Checkpoint")
+        dlg.setMinimumWidth(480)
+
+        form = QFormLayout()
+        container_edit = QLineEdit(self._container_edit.text().strip())
+        container_edit.setPlaceholderText("my-container")
+        prefix_edit = QLineEdit(self._prefix_edit.text().strip())
+        prefix_edit.setPlaceholderText("raw/events/2026/03/")
+        form.addRow("Container:", container_edit)
+        form.addRow("Prefix / Folder:", prefix_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Delete Checkpoint")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(
+            "Delete the checkpoint and failed-list files for the specified\n"
+            "container + prefix. The next run on this prefix will start fresh."
+        ))
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        container = container_edit.text().strip()
+        prefix = prefix_edit.text().strip()
+
+        if not container or not prefix:
+            QMessageBox.warning(self, "Clear Checkpoint", "Container and Prefix must not be empty.")
+            return
+
+        cp_path = RunCheckpoint.checkpoint_path(container, prefix)
+        fl_path = FailedList.failed_list_path(container, prefix)
+
+        deleted = []
+        for path in (cp_path, fl_path):
+            if path.exists():
+                path.unlink()
+                deleted.append(path.name)
+
+        if deleted:
+            self._log_info(
+                f"[Checkpoint] Deleted for '{container}/{prefix}': "
+                + ", ".join(deleted)
+            )
+            QMessageBox.information(
+                self, "Checkpoint Cleared",
+                f"Deleted {len(deleted)} file(s) for '{prefix}':\n"
+                + "\n".join(f"  • {n}" for n in deleted)
+            )
+        else:
+            QMessageBox.information(
+                self, "Checkpoint Cleared",
+                f"No checkpoint files found for '{container}/{prefix}'.\n"
+                "Nothing to delete."
+            )
 
     def _on_apply(self, dry_run: bool) -> None:
         col_configs = self._schema_table.get_column_configs()
