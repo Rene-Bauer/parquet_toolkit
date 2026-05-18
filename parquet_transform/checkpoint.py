@@ -93,18 +93,36 @@ def _now() -> str:
 
 class RunCheckpoint:
     """
-    Cursor-based checkpoint for a single transform run.
+    Set-based checkpoint for a single transform run.
 
-    The cursor is the blob name of the last successfully processed file.
-    On resume, all blobs that sort at or before the cursor are skipped.
-    Blob names from Azure are alphabetically sorted, which matches the
-    chronological folder structure (2026/03/01/10/...).
+    Each successfully processed blob name is recorded in a set.  On resume,
+    only blobs that are explicitly present in the set are skipped.
+
+    This replaces the previous cursor-based approach, which was unsafe for
+    parallel workers: with N workers running concurrently a later-sorting
+    blob processed by a fast worker could advance the cursor past earlier-
+    sorting blobs still in-flight, permanently excluding them from any
+    resumed run.  The set-based approach has no such race — each blob is
+    marked only after its upload completes.
+
+    Storage: a JSON list under the key "processed".  At ~50 bytes per blob
+    name, 100 k processed files ≈ 5 MB on disk, which is acceptable.
     """
+
+    # Flush the processed set to disk after every N calls to advance_cursor.
+    # The in-memory set is always complete and used for should_skip(); the
+    # on-disk copy is only for crash-recovery on resume.  A larger value
+    # reduces disk I/O at the cost of re-processing up to _FLUSH_INTERVAL
+    # files after a crash (safe because transforms are idempotent).
+    _FLUSH_INTERVAL: int = 100
 
     def __init__(self, path: Path, data: dict) -> None:
         self._path = path
         self._data = data
         self._lock = threading.Lock()
+        # Keep an in-memory set for O(1) lookup; the JSON list is the on-disk form.
+        self._processed: set[str] = set(data.get("processed", []))
+        self._unflushed: int = 0  # calls since last disk write
 
     @staticmethod
     def checkpoint_path(container: str, prefix: str) -> Path:
@@ -119,9 +137,10 @@ class RunCheckpoint:
     ) -> "RunCheckpoint":
         """Load an existing checkpoint or create a fresh in_progress one.
 
-        Note: when creating a new checkpoint (no file on disk), the file is not
-        written until the first call to advance_cursor() or mark_complete(). Use
-        checkpoint_path(...).exists() only after at least one blob has been processed.
+        Transparently migrates legacy cursor-based checkpoints: if the file
+        contains a ``cursor`` key but no ``processed`` list, the processed
+        set is left empty (safe — files will be re-processed on resume, which
+        is always correct because transforms are idempotent).
         """
         path = RunCheckpoint.checkpoint_path(container, prefix)
         if path.exists():
@@ -133,6 +152,12 @@ class RunCheckpoint:
                         f"Checkpoint file is corrupt and cannot be loaded: {path}\n"
                         f"Delete the file to start fresh. Detail: {exc}"
                     ) from exc
+            # Migrate legacy cursor format: drop the cursor key, ensure
+            # "processed" list exists (empty — safer than guessing what the
+            # cursor implied for parallel runs).
+            if "cursor" in data and "processed" not in data:
+                data["processed"] = []
+                del data["cursor"]
         else:
             now = _now()
             data = {
@@ -142,7 +167,7 @@ class RunCheckpoint:
                 "status": "in_progress",
                 "created_at": now,
                 "updated_at": now,
-                "cursor": None,
+                "processed": [],
             }
         return RunCheckpoint(path, data)
 
@@ -151,39 +176,55 @@ class RunCheckpoint:
         return self._data.get("status") == "complete"
 
     def should_skip(self, blob_name: str) -> bool:
-        """True if *blob_name* is at or before the cursor in the sorted listing."""
-        cursor = self._data.get("cursor")
-        if cursor is None:
-            return False
-        return blob_name <= cursor
+        """True if *blob_name* was already successfully processed in this run."""
+        return blob_name in self._processed
 
     @property
-    def cursor(self) -> str | None:
-        return self._data.get("cursor")
+    def processed_count(self) -> int:
+        """Number of blobs recorded as processed so far."""
+        return len(self._processed)
 
     def advance_cursor(self, blob_name: str) -> None:
-        """Move cursor forward if *blob_name* sorts later than the current cursor."""
+        """Record *blob_name* as successfully processed.
+
+        Named ``advance_cursor`` for API compatibility; internally uses a set.
+        Thread-safe.  Flushes to disk every _FLUSH_INTERVAL calls to avoid
+        writing a growing JSON on every single file (O(N²) I/O otherwise).
+        """
         with self._lock:
-            current = self._data.get("cursor")
-            if current is None or blob_name > current:
-                self._data["cursor"] = blob_name
-                self._data["updated_at"] = _now()
-                _atomic_write(self._path, self._data)
+            if blob_name in self._processed:
+                return  # already recorded — idempotent
+            self._processed.add(blob_name)
+            self._unflushed += 1
+            if self._unflushed >= self._FLUSH_INTERVAL:
+                self._flush_locked()
 
     def mark_complete(self) -> None:
-        """Mark the run as fully complete."""
+        """Flush any pending processed entries and mark the run as fully complete."""
         with self._lock:
             self._data["status"] = "complete"
+            self._flush_locked()
+
+    def reset(self) -> None:
+        """Clear processed set and status — use before a fresh-start run."""
+        with self._lock:
+            self._processed.clear()
+            self._unflushed = 0
+            self._data["status"] = "in_progress"
+            self._data["processed"] = []
             self._data["updated_at"] = _now()
             _atomic_write(self._path, self._data)
 
-    def reset(self) -> None:
-        """Clear cursor and status — use before a fresh-start run."""
-        with self._lock:
-            self._data["status"] = "in_progress"
-            self._data["cursor"] = None
-            self._data["updated_at"] = _now()
-            _atomic_write(self._path, self._data)
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _flush_locked(self) -> None:
+        """Write the current processed set to disk.  Caller must hold self._lock."""
+        self._data["processed"] = list(self._processed)
+        self._data["updated_at"] = _now()
+        _atomic_write(self._path, self._data)
+        self._unflushed = 0
 
 
 # ---------------------------------------------------------------------------

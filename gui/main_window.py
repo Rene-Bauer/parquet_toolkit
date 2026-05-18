@@ -723,14 +723,14 @@ class MainWindow(QMainWindow):
             cp.reset()
             fl.clear()
 
-        elif cp.cursor is not None:
+        elif cp.processed_count > 0:
             resuming = True
             # in_progress with a cursor — previous run was interrupted
             msg = QMessageBox(self)
             msg.setWindowTitle("Resume Previous Run")
             msg.setText(
                 f"A previous run for prefix '{prefix}' was interrupted.\n"
-                f"Last processed: {cp.cursor}\n\n"
+                f"{cp.processed_count} file(s) already processed.\n\n"
                 "Resume from where it left off, or start fresh?"
             )
             resume_btn = msg.addButton("Resume", QMessageBox.ButtonRole.AcceptRole)
@@ -980,6 +980,7 @@ class MainWindow(QMainWindow):
     def _on_transform_finished(
         self,
         processed: int,
+        skipped_count: int,
         failed_network: int,
         failed_corrupt: int,
         total_seconds: float,
@@ -987,9 +988,11 @@ class MainWindow(QMainWindow):
         retriable_failed_names: list,
     ) -> None:
         total_failed = failed_network + failed_corrupt
+        transformed = processed - skipped_count
+        total_files = processed + total_failed
         msg = (
             f"Done in {_format_duration(total_seconds)} (avg {avg_seconds:.2f}s/file). "
-            f"{processed} succeeded"
+            f"{total_files} files total: {transformed} transformed, {skipped_count} skipped"
         )
         if total_failed:
             parts = []

@@ -351,7 +351,7 @@ class TransformWorker(QThread):
     workers_reduced = pyqtSignal(int, int)
     file_error = pyqtSignal(str, str)
     corrupted_blob = pyqtSignal(str, str, int)
-    finished = pyqtSignal(int, int, int, float, float, list)
+    finished = pyqtSignal(int, int, int, int, float, float, list)
     cancelled = pyqtSignal()
     paused_signal = pyqtSignal()
     resumed_signal = pyqtSignal()
@@ -441,7 +441,7 @@ class TransformWorker(QThread):
                 self.listing_complete.emit(dict(blob_sizes))
             except Exception:
                 self.file_error.emit("(connection)", traceback.format_exc())
-                self.finished.emit(0, 1, 0, 0.0, 0.0, [])
+                self.finished.emit(0, 0, 1, 0, 0.0, 0.0, [])
                 return
 
         # Checkpoint: skip already-processed blobs on resume
@@ -472,7 +472,7 @@ class TransformWorker(QThread):
         if total == 0:
             if self._checkpoint:
                 self._checkpoint.mark_complete()
-            self.finished.emit(0, 0, 0, 0.0, 0.0, [])
+            self.finished.emit(0, 0, 0, 0, 0.0, 0.0, [])
             return
 
         # ------------------------------------------------------------------
@@ -490,6 +490,7 @@ class TransformWorker(QThread):
         # ------------------------------------------------------------------
         stats_lock = threading.Lock()
         processed       = 0
+        skipped_count   = 0
         failed_network  = 0
         failed_corrupt  = 0
         completed       = 0
@@ -527,16 +528,18 @@ class TransformWorker(QThread):
 
         def finalize_success(*, blob_name, worker_id, attempts, duration_ms,
                              skipped, note, size_bytes):
-            nonlocal processed, completed, total_duration_ms
+            nonlocal processed, skipped_count, completed, total_duration_ms
             first_real_trigger = False
             with stats_lock:
                 processed += 1
+                if skipped:
+                    skipped_count += 1
                 completed += 1
                 completed_so_far = completed
                 total_duration_ms += duration_ms
-                if self._checkpoint:
+                if self._checkpoint and not self._dry_run:
                     self._checkpoint.advance_cursor(blob_name)
-                if self._failed_list:
+                if self._failed_list and not self._dry_run:
                     self._failed_list.remove(blob_name)
                 if scaler is not None and not skipped:
                     self._completed_since_scale_check += 1
@@ -855,14 +858,14 @@ class TransformWorker(QThread):
             self.cancelled.emit()
             return
 
-        if self._checkpoint:
+        if self._checkpoint and not self._dry_run:
             self._checkpoint.mark_complete()
             self.log_message.emit("[Checkpoint] Run marked as complete")
 
         total_seconds = perf_counter() - start_time
         avg_seconds = (total_duration_ms / max(completed, 1)) / 1000.0 if completed else 0.0
         self.finished.emit(
-            processed, failed_network, failed_corrupt,
+            processed, skipped_count, failed_network, failed_corrupt,
             total_seconds, avg_seconds, retriable_failed_names,
         )
 
@@ -1145,11 +1148,21 @@ class DataCollectorWorker(QThread):
 
             subfolder_prefix = self._source_prefix.rstrip("/") + "/" + subfolder
 
+            # Derive the inner output prefix by appending the subfolder name.
+            # The outer worker's output_prefix points at the root output location;
+            # without this adjustment compute_output_name would strip the subfolder
+            # component and write all files flat into the output root.
+            # None means true in-place (blob_name unchanged) — no adjustment needed.
+            if self._output_prefix is not None:
+                inner_output_prefix = self._output_prefix.rstrip("/") + "/" + subfolder
+            else:
+                inner_output_prefix = None
+
             inner = DataCollectorWorker(
                 connection_string=self._conn,
                 container=self._container_name,
                 source_prefix=subfolder_prefix,
-                output_prefix=self._output_prefix,
+                output_prefix=inner_output_prefix,
                 filter_col=self._filter_col,
                 filter_values=self._filter_values,
                 output_container=self._output_container,
@@ -1160,6 +1173,7 @@ class DataCollectorWorker(QThread):
                 max_output_bytes=self._max_output_bytes,
                 start_part=checkpoint.next_part,
                 _is_subfolder_run=True,
+                source_schema=self._source_schema,
             )
 
             # Capture result and cancellation synchronously.
