@@ -1,4 +1,5 @@
 pyarrow>=14.0.0
+numpy>=1.24.0
 azure-storage-blob>=12.19.0
 PyQt6>=6.5.0
 psutil>=5.9.0
