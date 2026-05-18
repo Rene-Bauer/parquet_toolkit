@@ -708,38 +708,50 @@ class MainWindow(QMainWindow):
         retry_failed = False
         resuming = False
 
+        def _delete_checkpoint_files() -> None:
+            """Delete checkpoint and failed-list files from disk for a guaranteed clean state."""
+            cp_path = RunCheckpoint.checkpoint_path(container, prefix)
+            fl_path = FailedList.failed_list_path(container, prefix)
+            cp_path.unlink(missing_ok=True)
+            fl_path.unlink(missing_ok=True)
+
         if cp.is_complete():
             msg = QMessageBox(self)
             msg.setWindowTitle("Previous Run Complete")
             msg.setText(
                 f"The previous run for prefix '{prefix}' completed successfully.\n\n"
-                "Start a fresh run?"
+                "Start a fresh run? This will delete the existing checkpoint."
             )
             fresh_btn = msg.addButton("Start Fresh", QMessageBox.ButtonRole.AcceptRole)
             msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
             msg.exec()
             if msg.clickedButton() != fresh_btn:
                 return None  # user cancelled — caller should skip this prefix
-            cp.reset()
-            fl.clear()
+            _delete_checkpoint_files()
+            # Reload clean checkpoint and failed list after deletion
+            cp = RunCheckpoint.load_or_create(container, prefix, output_prefix)
+            fl = FailedList.load_or_create(container, prefix)
 
         elif cp.processed_count > 0:
             resuming = True
-            # in_progress with a cursor — previous run was interrupted
+            # in_progress with processed files — previous run was interrupted
             msg = QMessageBox(self)
             msg.setWindowTitle("Resume Previous Run")
             msg.setText(
                 f"A previous run for prefix '{prefix}' was interrupted.\n"
                 f"{cp.processed_count} file(s) already processed.\n\n"
-                "Resume from where it left off, or start fresh?"
+                "Resume skips those files and continues from where it left off.\n"
+                "Start Fresh deletes the checkpoint and processes all files again."
             )
             resume_btn = msg.addButton("Resume", QMessageBox.ButtonRole.AcceptRole)
             fresh_btn = msg.addButton("Start Fresh", QMessageBox.ButtonRole.DestructiveRole)
             msg.exec()
             if msg.clickedButton() == fresh_btn:
                 resuming = False
-                cp.reset()
-                fl.clear()
+                _delete_checkpoint_files()
+                # Reload clean checkpoint and failed list after deletion
+                cp = RunCheckpoint.load_or_create(container, prefix, output_prefix)
+                fl = FailedList.load_or_create(container, prefix)
 
         # Failed-list dialog: shown only when resuming
         if resuming and fl.entries:
