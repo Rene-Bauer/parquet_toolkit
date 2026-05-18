@@ -664,13 +664,29 @@ class TransformWorker(QThread):
                 try:
                     delta = self._maybe_run_scale_check(scaler, p95_bytes)
                     if delta > 0:
-                        # How many threads are genuinely still running?
-                        with _threads_lock:
-                            actual_alive = sum(1 for t in _threads if t.is_alive())
-                        target = self._worker_count  # just updated by _maybe_run_scale_check
-                        to_spawn = max(0, target - actual_alive)
-                        if to_spawn > 0:
-                            _spawn_workers(to_spawn)
+                        # Block scale-up if we're already low on RAM — spawning
+                        # new workers would immediately trigger OOM exits again.
+                        _block_spawn = False
+                        if _psutil is not None:
+                            _avail_mb = _psutil.virtual_memory().available / (1024 * 1024)
+                            if _avail_mb < OOM_WORKER_EXIT_MB:
+                                _block_spawn = True
+                                with _exit_lock:
+                                    self._worker_count = max(1, self._worker_count - delta)
+                                self.log_message.emit(
+                                    f"[OOM] Scale-up of +{delta} blocked "
+                                    f"({_avail_mb:.0f} MB available < "
+                                    f"{OOM_WORKER_EXIT_MB} MB threshold); "
+                                    f"target workers → {self._worker_count}"
+                                )
+                        if not _block_spawn:
+                            # How many threads are genuinely still running?
+                            with _threads_lock:
+                                actual_alive = sum(1 for t in _threads if t.is_alive())
+                            target = self._worker_count  # just updated by _maybe_run_scale_check
+                            to_spawn = max(0, target - actual_alive)
+                            if to_spawn > 0:
+                                _spawn_workers(to_spawn)
                     elif delta < 0:
                         # Request |delta| threads to exit after their current file.
                         # Each thread checks _exit_requested before pulling the next
@@ -704,10 +720,13 @@ class TransformWorker(QThread):
                         if _psutil is not None:
                             _avail_mb = _psutil.virtual_memory().available / (1024 * 1024)
                             if _avail_mb < OOM_WORKER_EXIT_MB:
+                                with _exit_lock:
+                                    self._worker_count = max(1, self._worker_count - 1)
                                 self.log_message.emit(
                                     f"[OOM] Worker {worker_id} exiting proactively: "
                                     f"{_avail_mb:.0f} MB available < "
-                                    f"{OOM_WORKER_EXIT_MB} MB threshold"
+                                    f"{OOM_WORKER_EXIT_MB} MB threshold "
+                                    f"(target workers → {self._worker_count})"
                                 )
                                 return
 
@@ -782,11 +801,12 @@ class TransformWorker(QThread):
                                     _oom_reduction = self._worker_count - _oom_target
                                     if _oom_reduction > 0:
                                         _exit_requested[0] += _oom_reduction
+                                        self._worker_count = _oom_target
                                 if _oom_reduction > 0:
                                     self.log_message.emit(
                                         f"[OOM] MemoryError on {blob_name!r} — "
                                         f"requesting {_oom_reduction} worker(s) to exit "
-                                        f"(target: {_oom_target})"
+                                        f"(target workers → {_oom_target})"
                                     )
 
                             if result.suppress_trace:
