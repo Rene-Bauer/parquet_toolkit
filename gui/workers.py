@@ -197,6 +197,7 @@ class _FileResult:
     upload_seconds: float = 0.0 # wall-clock seconds for the upload step only
     rows_converted: int = 0     # populated by ZipConverterWorker on success
     oom: bool = False           # True when PyArrow raised MemoryError mid-read
+    timing_detail: str = ""     # per-step breakdown: "dl=Xms rd=Xms tr=Xms wr=Xms up=Xms"
 
 
 def _first_line(text: str) -> str:
@@ -546,7 +547,7 @@ class TransformWorker(QThread):
             )
 
         def finalize_success(*, blob_name, worker_id, attempts, duration_ms,
-                             skipped, note, size_bytes):
+                             skipped, note, size_bytes, timing_detail: str = ""):
             nonlocal processed, skipped_count, completed, total_duration_ms
             first_real_trigger = False
             with stats_lock:
@@ -569,6 +570,12 @@ class TransformWorker(QThread):
 
             if first_real_trigger:
                 self.log_message.emit("[Autoscale WARN] First transformed file detected — forcing scale check")
+
+            if timing_detail and not skipped:
+                short_name = blob_name.split("/")[-1]
+                self.log_message.emit(
+                    f"[Timing] W{worker_id} {short_name} ({duration_ms:.0f}ms total) — {timing_detail}"
+                )
 
             self.progress.emit(completed_so_far, total, blob_name,
                                duration_ms, worker_id, skipped, note, size_bytes)
@@ -781,6 +788,7 @@ class TransformWorker(QThread):
                                 duration_ms=aggregated_duration,
                                 skipped=result.status == "skipped",
                                 note=result.skip_reason or "", size_bytes=size_bytes,
+                                timing_detail=result.timing_detail,
                             )
                             duration_tracker.pop(blob_name, None)
                             with pending_lock:
@@ -1028,9 +1036,12 @@ class TransformWorker(QThread):
         """Download, optionally transform, and upload a single blob once."""
         file_start = perf_counter()
         try:
+            t0 = perf_counter()
             raw = client.download_bytes(blob_name, timeout=DOWNLOAD_TIMEOUT_S)
+            t1 = perf_counter()
             buf = io.BytesIO(raw)
             table = pq.read_table(buf)
+            t2 = perf_counter()
 
             if self._should_skip_table(table):
                 return _FileResult(
@@ -1040,6 +1051,7 @@ class TransformWorker(QThread):
                 )
 
             table = apply_transforms(table, self._col_configs)
+            t3 = perf_counter()
             output_name = compute_output_name(
                 blob_name, self._prefix, self._output_prefix
             )
@@ -1049,18 +1061,29 @@ class TransformWorker(QThread):
             if not self._dry_run:
                 out_buf = io.BytesIO()
                 pq.write_table(table, out_buf, compression="zstd", compression_level=1)
+                t4 = perf_counter()
                 upload_data = out_buf.getvalue()
                 t_upload = perf_counter()
                 client.upload_bytes(output_name, upload_data,
                                     overwrite=True, timeout=UPLOAD_TIMEOUT_S)
                 upload_seconds = perf_counter() - t_upload
                 upload_bytes   = len(upload_data)
+            else:
+                t4 = perf_counter()
+
+            dl_ms  = (t1 - t0)  * 1000
+            rd_ms  = (t2 - t1)  * 1000
+            tr_ms  = (t3 - t2)  * 1000
+            wr_ms  = (t4 - t3)  * 1000
+            up_ms  = upload_seconds * 1000
+            timing = f"dl={dl_ms:.0f}ms rd={rd_ms:.0f}ms tr={tr_ms:.0f}ms wr={wr_ms:.0f}ms up={up_ms:.0f}ms"
 
             return _FileResult(
                 status="success",
                 duration_ms=(perf_counter() - file_start) * 1000.0,
                 upload_bytes=upload_bytes,
                 upload_seconds=upload_seconds,
+                timing_detail=timing,
             )
         except MemoryError as exc:
             # PyArrow's C++ allocator can raise MemoryError (or freeze) when
