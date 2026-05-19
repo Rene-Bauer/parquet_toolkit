@@ -1,11 +1,8 @@
 """Tests for SchemaLoaderWorker — parallel listing + subfolder schema sampling."""
 import collections
-import io
-import sys
 from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 from gui.workers import SchemaLoaderWorker, _merge_schemas
