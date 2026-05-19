@@ -375,6 +375,8 @@ class SchemaLoaderWorker(QThread):
                     else ""
                 )
 
+                suppressed: list[Exception] = []
+
                 def _read_one(name: str) -> pa.Schema | None:
                     sf_client = BlobStorageClient(
                         self._connection_string, self._container
@@ -385,7 +387,8 @@ class SchemaLoaderWorker(QThread):
                             return None
                         _, sub_schema = sf_client.read_parquet_footer(first)
                         return sub_schema
-                    except Exception:
+                    except Exception as exc:
+                        suppressed.append(exc)
                         return None
                     finally:
                         sf_client.close()
@@ -397,9 +400,10 @@ class SchemaLoaderWorker(QThread):
 
                 schemas = [s for s in results if s is not None]
                 if not schemas:
+                    cause = suppressed[0] if suppressed else None
                     raise RuntimeError(
                         f"No readable .parquet files found under prefix '{self._prefix}'."
-                    )
+                    ) from cause
                 return _merge_schemas(schemas)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:

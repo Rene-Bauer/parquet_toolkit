@@ -204,6 +204,38 @@ def test_schema_loader_merges_schemas_from_subfolders():
     assert "Id" in col_names    # from 2026 subfolder — this is what was missing before
 
 
+def test_schema_loader_emits_error_when_all_subfolder_reads_fail():
+    """When every per-subfolder read raises, an error signal is emitted (not a crash)."""
+    blobs = [("livedata/2025/a.parquet", 100), ("livedata/2026/b.parquet", 200)]
+
+    c_list = MagicMock()
+    c_list.list_blobs_with_sizes.return_value = blobs
+
+    c_schema = MagicMock()
+    c_schema.list_blob_prefixes.return_value = ["2025", "2026"]
+
+    call_idx = [0]
+
+    def client_factory(conn, container):
+        i = call_idx[0]
+        call_idx[0] += 1
+        if i == 0:
+            return c_list
+        if i == 1:
+            return c_schema
+        # Per-subfolder clients all raise on read_parquet_footer
+        m = MagicMock()
+        m.list_first_parquet_blob.return_value = "sf/first.parquet"
+        m.read_parquet_footer.side_effect = RuntimeError("Azure auth failure")
+        return m
+
+    with patch("gui.workers.BlobStorageClient", side_effect=client_factory):
+        worker = SchemaLoaderWorker("conn", "container", "livedata/")
+        results = _run_worker(worker)
+
+    assert "error" in results
+
+
 # ---------------------------------------------------------------------------
 # _merge_schemas
 # ---------------------------------------------------------------------------
