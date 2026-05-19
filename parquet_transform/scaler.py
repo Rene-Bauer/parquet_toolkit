@@ -79,6 +79,10 @@ class AdaptiveScaler:
         usl_min_levels: int = 5,
         usl_min_samples_per_level: int = 3,
         usl_agree_tolerance: float = 0.20,
+        # Phase A — CPU ceiling
+        cpu_count: int | None = None,
+        cpu_window_size: int = 20,
+        cpu_min_samples: int = 5,
     ) -> None:
         self._window: deque[_UploadRecord] = deque(maxlen=window_size)
         self._lock = threading.Lock()
@@ -135,6 +139,13 @@ class AdaptiveScaler:
         self._usl_n_opt: int | None = None
         self._usl_activation_fired: bool = False  # for one-shot "just activated" notification
 
+        # Phase A — CPU ceiling
+        self._cpu_count = cpu_count
+        self._cpu_window: deque[tuple[float, float]] = deque(maxlen=cpu_window_size)
+        self._cpu_min_samples = cpu_min_samples
+        self._cpu_n_opt: int | None = None
+        self._cpu_activated: bool = False  # for one-shot "just activated" notification
+
     # ------------------------------------------------------------------
     # Thread-safe data ingestion
     # ------------------------------------------------------------------
@@ -181,6 +192,55 @@ class AdaptiveScaler:
             if flagged:
                 self._hot_error_cooldown = self._hot_error_min_samples
             return flagged
+
+    def record_cpu_observation(self, cpu_ms: float, wall_ms: float) -> None:
+        """Thread-safe: record one (cpu_ms, wall_ms) measurement for Phase A.
+
+        cpu_ms  — time spent in CPU-bound steps (parquet read + zstd write).
+        wall_ms — total wall-clock duration for this file (= _FileResult.duration_ms).
+
+        Once cpu_min_samples observations are present the CPU-derived optimal
+        worker count N_opt = cpu_count / median(cpu_fraction) is stored and
+        used as a hard ceiling in should_scale().
+
+        Silently ignored when cpu_count was not provided at construction time.
+        """
+        if cpu_ms <= 0 or wall_ms <= 0 or self._cpu_count is None:
+            return
+        with self._lock:
+            self._cpu_window.append((cpu_ms, wall_ms))
+            if len(self._cpu_window) >= self._cpu_min_samples:
+                fractions = [c / w for c, w in self._cpu_window if w > 0]
+                if fractions:
+                    med_frac = statistics.median(fractions)
+                    if med_frac > 0:
+                        n_opt_f = self._cpu_count / med_frac
+                        self._cpu_n_opt = int(max(2, round(n_opt_f)))
+
+    def get_cpu_result(self) -> tuple[float | None, int | None]:
+        """Return ``(median_cpu_fraction, cpu_n_opt)`` from the latest CPU window.
+
+        Returns ``(None, None)`` when Phase A has not yet activated.
+        Thread-safe.
+        """
+        with self._lock:
+            if self._cpu_n_opt is None or not self._cpu_window:
+                return None, None
+            fractions = [c / w for c, w in self._cpu_window if w > 0]
+            med_frac = statistics.median(fractions) if fractions else None
+            return med_frac, self._cpu_n_opt
+
+    def cpu_just_activated(self) -> bool:
+        """Return True exactly once — the first time the CPU model becomes ready.
+
+        Thread-safe.  Designed to be polled after each ``should_scale`` call so
+        the caller can emit a log message when Phase A comes online.
+        """
+        with self._lock:
+            if self._cpu_n_opt is not None and not self._cpu_activated:
+                self._cpu_activated = True
+                return True
+            return False
 
     def usl_just_activated(self) -> bool:
         """Return True exactly once — the first time the USL model becomes ready.
@@ -444,7 +504,7 @@ class AdaptiveScaler:
         formula_reason: str,
         measured_bw_kbs: int,
     ) -> tuple[int, str]:
-        """Compare the Phase-B formula target against the USL N_opt (Phase C).
+        """Apply Phase C (USL) and Phase A (CPU) ceilings to the Phase B target.
 
         Returns ``(final_target, final_reason)``.  If ``final_target ==
         current_workers`` the caller should treat it as no change.
@@ -453,13 +513,38 @@ class AdaptiveScaler:
             usl_n_opt = self._usl_n_opt
             usl_alpha = self._usl_alpha
             usl_beta  = self._usl_beta
+            cpu_n_opt = self._cpu_n_opt
+            if self._cpu_window:
+                fracs = [c / w for c, w in self._cpu_window if w > 0]
+                cpu_frac = statistics.median(fracs) if fracs else 0.0
+            else:
+                cpu_frac = 0.0
 
-        if usl_n_opt is None:
-            # Phase C not ready yet — Phase B runs alone
+        # ── Neither Phase A nor Phase C ready — Phase B runs alone ────────────
+        if usl_n_opt is None and cpu_n_opt is None:
             return formula_target, formula_reason
 
-        # Already at or above USL optimum — block scale-up entirely
-        if current_workers >= usl_n_opt:
+        # ── Phase C not ready — apply Phase A ceiling only ────────────────────
+        if usl_n_opt is None:
+            # cpu_n_opt is not None here (checked above)
+            if current_workers >= cpu_n_opt:
+                return current_workers, ""
+            effective = min(formula_target, cpu_n_opt)
+            reason = formula_reason
+            if cpu_n_opt <= formula_target:
+                reason = (
+                    f"{formula_reason} → CPU ceiling: N_opt={cpu_n_opt} "
+                    f"(cores={self._cpu_count}, cpu_frac={cpu_frac:.2f})"
+                )
+            return max(current_workers, effective), reason
+
+        # ── Phase C active — compute USL-aware target ──────────────────────────
+
+        # Already at or above the tightest ceiling — block scale-up
+        tightest_ceiling = usl_n_opt
+        if cpu_n_opt is not None:
+            tightest_ceiling = min(tightest_ceiling, cpu_n_opt)
+        if current_workers >= tightest_ceiling:
             return current_workers, ""
 
         diff_ratio = abs(formula_target - usl_n_opt) / max(formula_target, usl_n_opt, 1)
@@ -479,6 +564,14 @@ class AdaptiveScaler:
                 f"{measured_bw_kbs} KB/s — formula={formula_target} vs "
                 f"USL N_opt={usl_n_opt} (α={usl_alpha:.3f} β={usl_beta:.4f}) "
                 f"— disagreement, conservative +1"
+            )
+
+        # ── Phase A: CPU ceiling applied on top of Phase C result ─────────────
+        if cpu_n_opt is not None and target > cpu_n_opt:
+            target = cpu_n_opt
+            reason = (
+                f"{reason} → CPU ceiling: N_opt={cpu_n_opt} "
+                f"(cores={self._cpu_count}, cpu_frac={cpu_frac:.2f})"
             )
 
         return max(current_workers, target), reason

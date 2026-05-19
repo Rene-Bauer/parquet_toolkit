@@ -440,3 +440,72 @@ def test_crash_cascade_ceiling_locked_at_first_halving():
         f"Effective bandwidth cap is {scaler.get_bandwidth_cap()} — "
         "crash ceiling cascaded down to 3 (the scale-up-blocking level)"
     )
+
+
+# ── Phase A: CPU ceiling tests ────────────────────────────────────────────────
+
+def _fill_cpu_observations(scaler, count: int, cpu_ms: float = 500.0, wall_ms: float = 1000.0) -> None:
+    for _ in range(count):
+        scaler.record_cpu_observation(cpu_ms, wall_ms)
+
+
+def test_cpu_ceiling_not_active_before_min_samples():
+    """CPU ceiling must NOT activate until cpu_min_samples observations are present."""
+    scaler = _make_scaler(cpu_count=2, cpu_window_size=10, cpu_min_samples=5)
+    _fill_cpu_observations(scaler, 4)  # one short of min_samples
+    cpu_frac, cpu_n_opt = scaler.get_cpu_result()
+    assert cpu_n_opt is None
+
+
+def test_cpu_n_opt_matches_formula():
+    """N_opt = cpu_count / median_cpu_fraction, rounded, min 2."""
+    # 50% CPU fraction → N_opt = 2 / 0.5 = 4
+    scaler = _make_scaler(cpu_count=2, cpu_window_size=10, cpu_min_samples=5)
+    _fill_cpu_observations(scaler, 5, cpu_ms=500.0, wall_ms=1000.0)
+    cpu_frac, cpu_n_opt = scaler.get_cpu_result()
+    assert abs(cpu_frac - 0.5) < 0.01
+    assert cpu_n_opt == 4
+
+
+def test_cpu_ceiling_adapts_to_cpu_count():
+    """N_opt scales proportionally with cpu_count at the same CPU fraction."""
+    for cpu_count, expected_n_opt in [(2, 4), (8, 16), (16, 32)]:
+        scaler = _make_scaler(cpu_count=cpu_count, cpu_window_size=10, cpu_min_samples=5)
+        # 50% CPU fraction: N_opt = cpu_count / 0.5 = 2 × cpu_count
+        _fill_cpu_observations(scaler, 5, cpu_ms=500.0, wall_ms=1000.0)
+        _, cpu_n_opt = scaler.get_cpu_result()
+        assert cpu_n_opt == expected_n_opt, (
+            f"cpu_count={cpu_count}: expected N_opt={expected_n_opt}, got {cpu_n_opt}"
+        )
+
+
+def test_cpu_ceiling_blocks_scale_up_beyond_n_opt():
+    """Phase A ceiling must cap scale-up to N_opt even when bandwidth headroom is huge."""
+    # cpu_count=2, 50% CPU fraction → N_opt=4
+    scaler = _make_scaler(
+        cpu_count=2,
+        cpu_window_size=10,
+        cpu_min_samples=5,
+        configured_max_workers=200,
+        min_samples=5,
+        up_confirm_checks=1,
+        up_min_headroom=1,
+    )
+    # Massive bandwidth → formula would suggest ~100+ workers
+    for _ in range(20):
+        scaler.record_upload(100_000_000, 1.0, True)  # 100 MB/s per connection
+    # Calibrate CPU: 50% fraction → N_opt = 2/0.5 = 4
+    _fill_cpu_observations(scaler, 5, cpu_ms=500.0, wall_ms=1000.0)
+    new_count, reason = scaler.should_scale(2, 100_000)
+    assert new_count <= 4, f"Expected ≤4 but got {new_count}"
+    if new_count > 2:
+        assert "cpu" in reason.lower() or "CPU" in reason
+
+
+def test_cpu_ceiling_ignores_zero_cpu_count():
+    """When cpu_count=None the CPU ceiling must not activate at all."""
+    scaler = _make_scaler(cpu_count=None, cpu_window_size=10, cpu_min_samples=5)
+    _fill_cpu_observations(scaler, 10, cpu_ms=500.0, wall_ms=1000.0)
+    cpu_frac, cpu_n_opt = scaler.get_cpu_result()
+    # record_cpu_observation silently returns when cpu_count is None
+    assert cpu_n_opt is None
