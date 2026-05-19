@@ -24,6 +24,26 @@ _TIMESTAMP_MS_UTC_TYPE = pa.timestamp("ms", tz="UTC")
 _REGISTRY: dict[str, tuple[TransformFn, str, list[str] | None]] = {}
 # key -> (fn, display_name, applicable_type_strings or None=all)
 
+# ---------------------------------------------------------------------------
+# Expected output types — used by workers to decide whether a file is already
+# at its target schema and can be skipped or counted as "done".
+# ---------------------------------------------------------------------------
+
+_EXPECTED_OUTPUT_TYPES: dict[str, "pa.DataType"] = {
+    "binary16_to_uuid": pa.string(),
+    "timestamp_ns_to_ms_utc": pa.timestamp("ms", tz="UTC"),
+}
+
+
+def get_expected_output_type(transform_name: str) -> "pa.DataType | None":
+    """Return the expected Arrow output DataType for a registered transform, or None.
+
+    Returns None for unknown transform names and for transforms that have no
+    fixed output type (e.g. passthrough transforms).  Callers that receive None
+    should treat the column as untransformable for skip-checking purposes.
+    """
+    return _EXPECTED_OUTPUT_TYPES.get(transform_name)
+
 
 def register(name: str, display_name: str, applicable_types: list[str] | None = None):
     """

@@ -24,6 +24,7 @@ from parquet_transform.checkpoint import SubfolderCheckpoint, FailedList, RunChe
 from parquet_transform.processor import ColumnConfig, apply_transforms, compute_output_name
 from parquet_transform.scaler import AdaptiveScaler
 from parquet_transform.storage import BlobStorageClient
+from parquet_transform.transforms import get_expected_output_type as _get_expected_output_type
 
 try:
     from azure.core.exceptions import (
@@ -163,12 +164,6 @@ On a reactive OOM (``MemoryError`` raised by PyArrow mid-read) the worker that
 hit the error additionally requests half the current workers to exit so that
 subsequent files get more address space.
 """
-
-
-_EXPECTED_OUTPUT_TYPES: dict[str, pa.DataType] = {
-    "binary16_to_uuid": pa.string(),
-    "timestamp_ns_to_ms_utc": pa.timestamp("ms", tz="UTC"),
-}
 
 
 # ---------------------------------------------------------------------------
@@ -1167,7 +1162,7 @@ class TransformWorker(QThread):
             return False
         schema = table.schema
         for cfg in self._col_configs:
-            expected = _EXPECTED_OUTPUT_TYPES.get(cfg.transform)
+            expected = _get_expected_output_type(cfg.transform)
             if expected is None:
                 return False
             if cfg.name not in schema.names:

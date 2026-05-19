@@ -259,3 +259,24 @@ class TestTimestampNsToMsUtc:
         array = pa.array([None], type=pa.timestamp("ns"))
         result = tr.timestamp_ns_to_ms_utc(array, params={})
         assert result[0].as_py() is None
+
+
+# ---------------------------------------------------------------------------
+# get_expected_output_type
+# ---------------------------------------------------------------------------
+
+def test_get_expected_output_type_uuid():
+    import pyarrow as pa
+    from parquet_transform.transforms import get_expected_output_type
+    assert get_expected_output_type("binary16_to_uuid") == pa.string()
+
+
+def test_get_expected_output_type_timestamp():
+    import pyarrow as pa
+    from parquet_transform.transforms import get_expected_output_type
+    assert get_expected_output_type("timestamp_ns_to_ms_utc") == pa.timestamp("ms", tz="UTC")
+
+
+def test_get_expected_output_type_unknown_returns_none():
+    from parquet_transform.transforms import get_expected_output_type
+    assert get_expected_output_type("no_such_transform") is None
