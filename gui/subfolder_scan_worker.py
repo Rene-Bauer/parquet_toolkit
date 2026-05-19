@@ -45,6 +45,12 @@ def _check_file(schema: pa.Schema, col_configs: list[ColumnConfig]) -> bool:
             continue  # column absent in this file → nothing to transform here
         if schema.field(cfg.name).type != expected:
             return False
+    # NOTE: When col_configs is empty every file is trivially done from the scan's
+    # perspective (the loop above doesn't execute → fall through to True). This
+    # diverges from TransformWorker._should_skip_table, which returns False for
+    # empty configs (process everything). The caller (_on_scan_subfolders in
+    # main_window.py) guards against empty configs before constructing this worker,
+    # so this path is unreachable in normal use.
     return True
 
 
