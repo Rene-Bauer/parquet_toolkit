@@ -40,10 +40,26 @@ class TestRunCheckpointPath:
 class TestRunCheckpointLoadOrCreate:
     def test_creates_new_checkpoint_when_no_file(self, checkpoint_dir):
         cp = RunCheckpoint.load_or_create("c", "p/", None)
-        assert cp.cursor is None
+        assert cp.processed_count == 0
         assert not cp.is_complete()
 
-    def test_loads_existing_checkpoint(self, checkpoint_dir):
+    def test_loads_existing_processed_checkpoint(self, checkpoint_dir):
+        path = RunCheckpoint.checkpoint_path("c", "p/")
+        path.write_text(json.dumps({
+            "container": "c", "prefix": "p/", "output_prefix": None,
+            "status": "in_progress", "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+            "processed": ["p/file-0042.parquet", "p/file-0043.parquet"],
+        }), encoding="utf-8")
+        cp = RunCheckpoint.load_or_create("c", "p/", None)
+        assert cp.processed_count == 2
+        assert cp.should_skip("p/file-0042.parquet")
+        assert cp.should_skip("p/file-0043.parquet")
+
+    def test_migrates_legacy_cursor_checkpoint(self, checkpoint_dir):
+        """A file with only a 'cursor' key (old format) is migrated: cursor is
+        dropped and processed list starts empty (transforms are idempotent, so
+        re-processing a few files on resume is always safe)."""
         path = RunCheckpoint.checkpoint_path("c", "p/")
         path.write_text(json.dumps({
             "container": "c", "prefix": "p/", "output_prefix": None,
@@ -51,7 +67,8 @@ class TestRunCheckpointLoadOrCreate:
             "updated_at": "2026-01-01T00:00:00", "cursor": "p/file-0042.parquet",
         }), encoding="utf-8")
         cp = RunCheckpoint.load_or_create("c", "p/", None)
-        assert cp.cursor == "p/file-0042.parquet"
+        assert cp.processed_count == 0
+        assert not cp.is_complete()
 
     def test_loads_complete_status(self, checkpoint_dir):
         path = RunCheckpoint.checkpoint_path("c", "p/")
@@ -65,41 +82,46 @@ class TestRunCheckpointLoadOrCreate:
 
 
 class TestRunCheckpointShouldSkip:
-    def test_no_cursor_skips_nothing(self, checkpoint_dir):
+    def test_no_processed_blobs_skips_nothing(self, checkpoint_dir):
         cp = RunCheckpoint.load_or_create("c", "p/", None)
         assert not cp.should_skip("p/a.parquet")
 
-    def test_skips_blobs_at_or_before_cursor(self, checkpoint_dir):
+    def test_skips_only_processed_blobs(self, checkpoint_dir):
+        """Set-based: only the exact blob passed to advance_cursor is skipped."""
         cp = RunCheckpoint.load_or_create("c", "p/", None)
         cp.advance_cursor("p/b.parquet")
-        assert cp.should_skip("p/a.parquet")
-        assert cp.should_skip("p/b.parquet")
-        assert not cp.should_skip("p/c.parquet")
+        assert not cp.should_skip("p/a.parquet")  # not processed — not skipped
+        assert cp.should_skip("p/b.parquet")       # processed — skipped
+        assert not cp.should_skip("p/c.parquet")   # not processed — not skipped
 
-    def test_does_not_skip_blobs_after_cursor(self, checkpoint_dir):
+    def test_does_not_skip_unprocessed_blobs(self, checkpoint_dir):
         cp = RunCheckpoint.load_or_create("c", "p/", None)
         cp.advance_cursor("p/2026/03/01/part-0010.parquet")
         assert not cp.should_skip("p/2026/03/02/part-0001.parquet")
 
 
 class TestRunCheckpointAdvanceCursor:
-    def test_cursor_advances_to_later_blob(self, checkpoint_dir):
+    def test_advance_cursor_records_blob(self, checkpoint_dir):
         cp = RunCheckpoint.load_or_create("c", "p/", None)
         cp.advance_cursor("p/b.parquet")
-        assert cp.cursor == "p/b.parquet"
+        assert cp.processed_count == 1
+        assert cp.should_skip("p/b.parquet")
 
-    def test_cursor_does_not_go_backward(self, checkpoint_dir):
+    def test_advance_cursor_is_idempotent(self, checkpoint_dir):
+        """Calling advance_cursor twice for the same blob counts it only once."""
         cp = RunCheckpoint.load_or_create("c", "p/", None)
-        cp.advance_cursor("p/c.parquet")
         cp.advance_cursor("p/a.parquet")
-        assert cp.cursor == "p/c.parquet"
+        cp.advance_cursor("p/a.parquet")
+        assert cp.processed_count == 1
 
-    def test_advance_cursor_writes_to_disk(self, checkpoint_dir):
+    def test_advance_cursor_flushes_to_disk_at_interval(self, checkpoint_dir):
+        """Processed set is written to disk after _FLUSH_INTERVAL calls."""
         cp = RunCheckpoint.load_or_create("c", "p/", None)
-        cp.advance_cursor("p/x.parquet")
+        for i in range(RunCheckpoint._FLUSH_INTERVAL):
+            cp.advance_cursor(f"p/file-{i:04d}.parquet")
         path = RunCheckpoint.checkpoint_path("c", "p/")
         data = json.loads(path.read_text(encoding="utf-8"))
-        assert data["cursor"] == "p/x.parquet"
+        assert len(data["processed"]) == RunCheckpoint._FLUSH_INTERVAL
 
     def test_advance_cursor_is_thread_safe(self, checkpoint_dir):
         cp = RunCheckpoint.load_or_create("c", "p/", None)
@@ -112,7 +134,7 @@ class TestRunCheckpointAdvanceCursor:
             t.start()
         for t in threads:
             t.join()
-        assert cp.cursor == "p/file-0099.parquet"
+        assert cp.processed_count == 100
 
 
 class TestRunCheckpointMarkComplete:
@@ -130,12 +152,13 @@ class TestRunCheckpointMarkComplete:
 
 
 class TestRunCheckpointReset:
-    def test_reset_clears_cursor_and_status(self, checkpoint_dir):
+    def test_reset_clears_processed_set_and_status(self, checkpoint_dir):
         cp = RunCheckpoint.load_or_create("c", "p/", None)
         cp.advance_cursor("p/x.parquet")
         cp.mark_complete()
         cp.reset()
-        assert cp.cursor is None
+        assert cp.processed_count == 0
+        assert not cp.should_skip("p/x.parquet")
         assert not cp.is_complete()
 
     def test_reset_persists_to_disk(self, checkpoint_dir):
@@ -144,7 +167,7 @@ class TestRunCheckpointReset:
         cp.reset()
         path = RunCheckpoint.checkpoint_path("c", "p/")
         data = json.loads(path.read_text(encoding="utf-8"))
-        assert data["cursor"] is None
+        assert data["processed"] == []
         assert data["status"] == "in_progress"
 
 
