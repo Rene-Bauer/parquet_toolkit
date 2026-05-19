@@ -814,6 +814,11 @@ class MainWindow(QMainWindow):
 
     def _on_scan_subfolders(self) -> None:
         """Open the subfolder scan dialog for the currently loaded prefix."""
+        # Stop any still-running scan from a previous dialog session
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self._scan_worker.cancel()
+            self._scan_worker.wait(3_000)
+
         conn = self._conn_str_edit.text().strip()
         container = self._container_edit.text().strip()
         prefix = self._prefix_edit.text().strip()
@@ -860,8 +865,8 @@ class MainWindow(QMainWindow):
             entries.append(
                 _PendingEntry(
                     prefix=r.prefix,
-                    blob_names=r.pending_blobs if r.pending_blobs else None,
-                    blob_sizes=r.pending_sizes if r.pending_sizes else None,
+                    blob_names=r.pending_blobs if r.pending_blobs is not None else None,
+                    blob_sizes=r.pending_sizes if r.pending_sizes is not None else None,
                 )
             )
 
@@ -878,6 +883,7 @@ class MainWindow(QMainWindow):
         self._dry_run = False
         self._retry_depth = 0
         self._corrupted_blobs = []
+        self._unknown_size_blobs = []
         self._pending_prefixes = entries
         self._current_prefix_index = 0
         self._blob_sizes = {}
@@ -1534,7 +1540,12 @@ class MainWindow(QMainWindow):
         if self._schema_worker is not None and self._schema_worker.isRunning():
             self._schema_worker.wait(5_000)
 
-        # 4. System monitor.
+        # 4. Subfolder scan worker.
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self._scan_worker.cancel()
+            self._scan_worker.wait(5_000)
+
+        # 5. System monitor.
         self._sys_monitor.stop()
         self._sys_monitor.wait(2000)
         super().closeEvent(event)
