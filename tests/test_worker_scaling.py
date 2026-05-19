@@ -80,3 +80,16 @@ def test_maybe_run_scale_check_interval_resets_counter():
     worker._maybe_run_scale_check(scaler, 1_000_000)
     assert scaler.should_scale_calls == 1
     assert worker._completed_since_scale_check == 0
+
+
+def test_file_result_has_cpu_ms():
+    """_FileResult must carry a numeric cpu_ms field populated from rd+wr timings."""
+    from gui.workers import _FileResult
+    r = _FileResult(status="success", duration_ms=900.0, cpu_ms=500.0)
+    assert r.cpu_ms == 500.0
+
+
+def test_file_result_cpu_ms_defaults_to_zero():
+    from gui.workers import _FileResult
+    r = _FileResult(status="error", duration_ms=100.0)
+    assert r.cpu_ms == 0.0

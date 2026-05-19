@@ -198,6 +198,7 @@ class _FileResult:
     rows_converted: int = 0     # populated by ZipConverterWorker on success
     oom: bool = False           # True when PyArrow raised MemoryError mid-read
     timing_detail: str = ""     # per-step breakdown: "dl=Xms rd=Xms tr=Xms wr=Xms up=Xms"
+    cpu_ms: float = 0.0         # rd_ms + wr_ms — CPU-bound (zstd) portion; fed to Phase A scaler
 
 
 def _first_line(text: str) -> str:
@@ -1086,6 +1087,7 @@ class TransformWorker(QThread):
                 upload_bytes=upload_bytes,
                 upload_seconds=upload_seconds,
                 timing_detail=timing,
+                cpu_ms=rd_ms + wr_ms,
             )
         except MemoryError as exc:
             # PyArrow's C++ allocator can raise MemoryError (or freeze) when
