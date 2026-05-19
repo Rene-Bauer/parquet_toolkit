@@ -29,13 +29,13 @@ _REGISTRY: dict[str, tuple[TransformFn, str, list[str] | None]] = {}
 # at its target schema and can be skipped or counted as "done".
 # ---------------------------------------------------------------------------
 
-_EXPECTED_OUTPUT_TYPES: dict[str, "pa.DataType"] = {
-    "binary16_to_uuid": pa.string(),
-    "timestamp_ns_to_ms_utc": pa.timestamp("ms", tz="UTC"),
+_EXPECTED_OUTPUT_TYPES: dict[str, pa.DataType] = {
+    "binary16_to_uuid": _UUID_STRING_TYPE,
+    "timestamp_ns_to_ms_utc": _TIMESTAMP_MS_UTC_TYPE,
 }
 
 
-def get_expected_output_type(transform_name: str) -> "pa.DataType | None":
+def get_expected_output_type(transform_name: str) -> pa.DataType | None:
     """Return the expected Arrow output DataType for a registered transform, or None.
 
     Returns None for unknown transform names and for transforms that have no
