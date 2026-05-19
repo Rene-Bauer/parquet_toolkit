@@ -46,6 +46,8 @@ from gui.system_monitor_worker import SystemMonitorWorker
 from gui.workers import SchemaLoaderWorker, TransformWorker, _format_bytes
 from gui.collector_panel import CollectorPanel
 from gui.zip_panel import ZipPanel
+from gui.subfolder_scan_worker import SubfolderScanWorker
+from gui.subfolder_panel import SubfolderPanel
 
 from parquet_transform import transforms as tr
 from parquet_transform.checkpoint import FailedList, RunCheckpoint
@@ -130,6 +132,7 @@ class MainWindow(QMainWindow):
 
         self._schema_worker: SchemaLoaderWorker | None = None
         self._transform_worker: TransformWorker | None = None
+        self._scan_worker: SubfolderScanWorker | None = None
         self._file_count: int = 0
         self._dry_run: bool = False
 
@@ -384,6 +387,13 @@ class MainWindow(QMainWindow):
         self._apply_btn.setFixedWidth(150)
         self._apply_btn.clicked.connect(lambda: self._on_apply(dry_run=False))
 
+        self._scan_btn = QPushButton("Scan Subfolders…")
+        self._scan_btn.setToolTip(
+            "List all subfolders and scan their schemas to find which need transformation"
+        )
+        self._scan_btn.setEnabled(False)
+        self._scan_btn.clicked.connect(self._on_scan_subfolders)
+
         # Feature 13: Pause / Resume
         self._pause_btn = QPushButton("Pause")
         self._pause_btn.setFixedWidth(80)
@@ -409,6 +419,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._clear_cp_btn)
         layout.addStretch()
         layout.addWidget(self._apply_btn)
+        layout.addWidget(self._scan_btn)
         layout.addWidget(self._pause_btn)
         layout.addWidget(self._cancel_btn)
         return widget
@@ -497,6 +508,7 @@ class MainWindow(QMainWindow):
         self._load_btn.setEnabled(True)
         self._dryrun_btn.setEnabled(False)
         self._apply_btn.setEnabled(False)
+        self._scan_btn.setEnabled(False)
         self._failed_btn.setEnabled(False)
         self._pause_btn.setEnabled(False)
         self._cancel_btn.setEnabled(False)
@@ -507,6 +519,7 @@ class MainWindow(QMainWindow):
         self._load_btn.setEnabled(False)
         self._dryrun_btn.setEnabled(False)
         self._apply_btn.setEnabled(False)
+        self._scan_btn.setEnabled(False)
         self._status_label.setText("Loading schema...")
 
     def _set_schema_loaded_state(self) -> None:
@@ -514,6 +527,7 @@ class MainWindow(QMainWindow):
         self._load_btn.setEnabled(True)
         self._dryrun_btn.setEnabled(True)
         self._apply_btn.setEnabled(True)
+        self._scan_btn.setEnabled(True)
         self._failed_btn.setEnabled(True)
         self._pause_btn.setEnabled(False)
         self._pause_btn.setText("Pause")
@@ -529,6 +543,7 @@ class MainWindow(QMainWindow):
         self._load_btn.setEnabled(False)
         self._dryrun_btn.setEnabled(False)
         self._apply_btn.setEnabled(False)
+        self._scan_btn.setEnabled(False)
         self._failed_btn.setEnabled(False)
         self._pause_btn.setEnabled(True)
         self._pause_btn.setText("Pause")
@@ -638,6 +653,7 @@ class MainWindow(QMainWindow):
         self._set_schema_loaded_state()
         self._dryrun_btn.setEnabled(False)
         self._apply_btn.setEnabled(False)
+        self._scan_btn.setEnabled(False)
         self._failed_btn.setEnabled(False)
         self._load_btn.setEnabled(True)
         self._log_error(f"Failed to load schema:\n{msg}")
@@ -794,6 +810,89 @@ class MainWindow(QMainWindow):
                 f"Batch mode: {len(self._pending_prefixes)} prefix(es) queued."
             )
 
+        self._start_next_prefix()
+
+    def _on_scan_subfolders(self) -> None:
+        """Open the subfolder scan dialog for the currently loaded prefix."""
+        conn = self._conn_str_edit.text().strip()
+        container = self._container_edit.text().strip()
+        prefix = self._prefix_edit.text().strip()
+
+        col_configs = self._schema_table.get_column_configs()
+        if not col_configs:
+            self._log_info("[Scan] No transforms configured — configure transforms first.")
+            return
+
+        if not conn or not container:
+            self._log_error("[Scan] Connection string and container are required.")
+            return
+
+        self._scan_worker = SubfolderScanWorker(
+            connection_string=conn,
+            container=container,
+            header_prefix=prefix,
+            col_configs=col_configs,
+            scan_workers=16,
+            parent=self,
+        )
+        self._scan_worker.log_message.connect(self._log_info)
+        self._scan_worker.error.connect(
+            lambda msg: self._log_error(f"[Scan] Error: {msg}")
+        )
+
+        panel = SubfolderPanel(self._scan_worker, parent=self)
+        panel.run_requested.connect(self._on_scan_run_requested)
+
+        self._scan_worker.start()
+        panel.exec()   # modal — blocks until user closes or clicks Run
+
+    def _on_scan_run_requested(self, results: list) -> None:
+        """Start a transform run from subfolder scan results.
+
+        Green subfolders are skipped entirely.
+        Red subfolders: all files passed directly (no re-listing needed).
+        Yellow subfolders: only the pending (untransformed) files are passed.
+        """
+        entries = []
+        for r in results:
+            if r.status == "green" or r.status == "grey":
+                continue
+            entries.append(
+                _PendingEntry(
+                    prefix=r.prefix,
+                    blob_names=r.pending_blobs if r.pending_blobs else None,
+                    blob_sizes=r.pending_sizes if r.pending_sizes else None,
+                )
+            )
+
+        if not entries:
+            self._log_info("[Scan] All selected subfolders are already done — nothing to run.")
+            return
+
+        col_configs = self._schema_table.get_column_configs()
+        if not col_configs:
+            self._log_error("[Scan] No transforms configured.")
+            return
+
+        self._run_col_configs = col_configs
+        self._dry_run = False
+        self._retry_depth = 0
+        self._corrupted_blobs = []
+        self._pending_prefixes = entries
+        self._current_prefix_index = 0
+        self._blob_sizes = {}
+        self._run_start_time = perf_counter()
+        self._bytes_processed = 0
+        self._files_completed_in_run = 0
+        self._total_files_in_run = sum(
+            len(e.blob_names) for e in entries if e.blob_names is not None
+        )
+
+        _prevent_standby()
+        n = len(entries)
+        self._log_info(
+            f"[Scan] Starting batch from scan results: {n} subfolder(s) selected."
+        )
         self._start_next_prefix()
 
     # ------------------------------------------------------------------
