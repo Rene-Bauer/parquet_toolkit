@@ -38,10 +38,7 @@ def _check_file(schema: pa.Schema, col_configs: list[ColumnConfig]) -> bool:
             return False  # unknown transform → can't confirm done
         if cfg.name not in schema.names:
             return False  # column absent → can't confirm done
-        try:
-            actual_type = schema.field(cfg.name).type
-        except KeyError:
-            return False
+        actual_type = schema.field(cfg.name).type
         if actual_type != expected:
             return False
     return True
@@ -227,13 +224,17 @@ class SubfolderScanWorker(QThread):
             )
 
         for r in yellow_results:
+            # Cancellation is checked between subfolders, not between individual files
+            # within a subfolder's deep scan. For very large subfolders this may delay
+            # shutdown by the time needed to scan one subfolder's full file list.
             if self._cancelled:
                 break
 
             c = BlobStorageClient(self._conn_str, self._container)
+            pending_sizes_snapshot = r.pending_sizes  # snapshot before closure to avoid late-binding
 
             def _check_one(blob_name: str) -> tuple[str, bool]:
-                known = r.pending_sizes.get(blob_name)
+                known = pending_sizes_snapshot.get(blob_name)
                 _, schema = c.read_parquet_footer(blob_name, known_size=known)
                 return blob_name, _check_file(schema, self._col_configs)
 
@@ -247,7 +248,7 @@ class SubfolderScanWorker(QThread):
                         done_count += 1
                     else:
                         pending_blobs.append(blob_name)
-                        pending_sizes[blob_name] = r.pending_sizes.get(blob_name, -1)
+                        pending_sizes[blob_name] = pending_sizes_snapshot.get(blob_name, -1)
 
             final = SubfolderScanResult(
                 r.name, r.prefix, r.total,
