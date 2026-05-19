@@ -135,6 +135,22 @@ N_opt (Phase C) are considered to *agree*.  When they agree the USL ceiling is
 enforced; when they disagree the more conservative of the two is used and the
 scaler adds only one worker at a time until they converge.  0.20 = within 20%."""
 
+# --- Phase A: CPU ceiling ---
+
+SCALER_CPU_WINDOW_SIZE: int = 20
+"""Rolling window size for CPU-fraction measurements (number of files).
+
+At 4 workers processing ~1 file/s this is ~5 s of history — responsive to
+changes in workload without over-reacting to individual outliers.
+"""
+
+SCALER_CPU_MIN_SAMPLES: int = 5
+"""Minimum CPU-fraction samples before Phase A ceiling becomes active.
+
+With 5 samples the ceiling activates after the first ~5 successful files,
+giving the scaler a quick initial calibration before it tries to ramp up.
+"""
+
 OOM_WORKER_EXIT_MB: int = 512
 """Available-RAM threshold for proactive worker self-exit.
 
@@ -547,6 +563,9 @@ class TransformWorker(QThread):
                 usl_min_levels=SCALER_USL_MIN_LEVELS,
                 usl_min_samples_per_level=SCALER_USL_MIN_SAMPLES_PER_LEVEL,
                 usl_agree_tolerance=SCALER_USL_AGREE_TOLERANCE,
+                cpu_count=_psutil.cpu_count(logical=True) if _psutil is not None else None,
+                cpu_window_size=SCALER_CPU_WINDOW_SIZE,
+                cpu_min_samples=SCALER_CPU_MIN_SAMPLES,
             )
 
         def finalize_success(*, blob_name, worker_id, attempts, duration_ms,
@@ -773,12 +792,15 @@ class TransformWorker(QThread):
                         )
                         aggregated_duration = duration_tracker[blob_name]
 
-                        # Feed upload measurement to scaler
+                        # Feed upload and CPU measurements to scaler
                         if scaler is not None:
                             if result.upload_bytes > 0 and result.upload_seconds > 0:
                                 scaler.record_upload(result.upload_bytes, result.upload_seconds, True)
                             elif result.status == "error":
                                 scaler.record_upload(0, 0.0, False)
+                            # Phase A: feed CPU observation on every successful (non-skipped) file
+                            if result.status == "success" and result.cpu_ms > 0:
+                                scaler.record_cpu_observation(result.cpu_ms, result.duration_ms)
                             if scaler.consume_hot_error_flag():
                                 self._pending_force_scale = True
                                 self.log_message.emit("[Autoscale WARN] Timeout spike detected — forcing scale check")
@@ -1015,6 +1037,16 @@ class TransformWorker(QThread):
             self.log_message.emit(
                 f"[USL] Model fitted — α={alpha:.3f} (contention) "
                 f"β={beta:.4f} (coherency) → N_opt={n_opt} workers"
+            )
+
+        # Log the moment Phase A (CPU ceiling) first comes online
+        if scaler.cpu_just_activated():
+            cpu_frac, cpu_n_opt = scaler.get_cpu_result()
+            self.log_message.emit(
+                f"[CPU] Phase A active — "
+                f"cpu_frac={cpu_frac:.2f} ({cpu_frac * 100:.0f}% CPU-bound) "
+                f"→ N_opt={cpu_n_opt} workers "
+                f"(cores={_psutil.cpu_count(logical=True) if _psutil is not None else '?'})"
             )
 
         # Log and signal whenever the effective bandwidth ceiling changes (grows or shrinks)
@@ -2008,6 +2040,9 @@ class ZipConverterWorker(QThread):
                 usl_min_levels=SCALER_USL_MIN_LEVELS,
                 usl_min_samples_per_level=SCALER_USL_MIN_SAMPLES_PER_LEVEL,
                 usl_agree_tolerance=SCALER_USL_AGREE_TOLERANCE,
+                cpu_count=_psutil.cpu_count(logical=True) if _psutil is not None else None,
+                cpu_window_size=SCALER_CPU_WINDOW_SIZE,
+                cpu_min_samples=SCALER_CPU_MIN_SAMPLES,
             )
 
         def _process_zip_once(client: BlobStorageClient, blob_name: str) -> "_FileResult":

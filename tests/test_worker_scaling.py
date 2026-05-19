@@ -30,6 +30,12 @@ class DummyScaler:
     def get_usl_result(self):
         return None, None, None
 
+    def cpu_just_activated(self) -> bool:
+        return False
+
+    def get_cpu_result(self):
+        return None, None
+
     def consume_hot_error_flag(self) -> bool:  # pragma: no cover - only for interface completeness
         return False
 
