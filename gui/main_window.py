@@ -1077,10 +1077,16 @@ class MainWindow(QMainWindow):
         label = "[DRY RUN] " if self._dry_run else ""
 
         if blob_names is not None:
-            self._log_info(
-                f"{label}Auto-retry #{self._retry_depth} — {len(blob_names)} file(s), "
-                f"{worker_count} worker(s), {max_attempts} attempt(s)/file..."
-            )
+            if self._retry_depth == 0:
+                self._log_info(
+                    f"{label}[Scan] Starting {len(blob_names)} file(s), "
+                    f"{worker_count} worker(s), {max_attempts} attempt(s)/file..."
+                )
+            else:
+                self._log_info(
+                    f"{label}Auto-retry #{self._retry_depth} — {len(blob_names)} file(s), "
+                    f"{worker_count} worker(s), {max_attempts} attempt(s)/file..."
+                )
         else:
             mode_str = " (Auto-Scale ON)" if autoscale else ""
             self._log_info(

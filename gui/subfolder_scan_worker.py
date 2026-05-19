@@ -42,6 +42,11 @@ def _check_file(schema: pa.Schema, col_configs: list[ColumnConfig]) -> bool:
         actual_type = schema.field(cfg.name).type
         if actual_type != expected:
             return False
+    # When col_configs is empty, every file is trivially "done" from the scan's perspective.
+    # NOTE: this diverges from TransformWorker._should_skip_table, which returns False for
+    # empty configs (process everything). The scan entry point (_on_scan_subfolders) guards
+    # against empty configs before creating this worker, so this path is unreachable in normal
+    # use. If that guard is ever removed, callers must be aware of this difference.
     return True
 
 
@@ -231,12 +236,14 @@ class SubfolderScanWorker(QThread):
             if self._cancel_event.is_set():
                 break
 
-            c = BlobStorageClient(self._conn_str, self._container)
             pending_sizes_snapshot = r.pending_sizes  # snapshot before closure to avoid late-binding
 
             def _check_one(blob_name: str) -> tuple[str, bool]:
+                # Create a per-thread client — BlobStorageClient's underlying HTTP session
+                # is not guaranteed thread-safe for concurrent range reads.
+                thread_client = BlobStorageClient(self._conn_str, self._container)
                 known = pending_sizes_snapshot.get(blob_name)
-                _, schema = c.read_parquet_footer(blob_name, known_size=known)
+                _, schema = thread_client.read_parquet_footer(blob_name, known_size=known)
                 return blob_name, _check_file(schema, self._col_configs)
 
             done_count = 0
