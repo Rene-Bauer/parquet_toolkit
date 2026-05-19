@@ -45,8 +45,28 @@ from gui.system_monitor_worker import SystemMonitorWorker
 from gui.workers import SchemaLoaderWorker, TransformWorker, _format_bytes
 from gui.collector_panel import CollectorPanel
 from gui.zip_panel import ZipPanel
+from dataclasses import dataclass, field as _dc_field
+
 from parquet_transform import transforms as tr
 from parquet_transform.checkpoint import FailedList, RunCheckpoint
+
+
+@dataclass
+class _PendingEntry:
+    """One entry in the batch prefix queue.
+
+    For normal prefix-based runs (from the Apply button or batch textarea),
+    blob_names and blob_sizes are None and TransformWorker lists the prefix.
+
+    For scan-driven runs (from SubfolderPanel), blob_names is a pre-filtered
+    list of files that still need transformation, and blob_sizes holds the
+    sizes already obtained during the scan — so TransformWorker can start
+    immediately without re-listing or downloading already-done files.
+    """
+    prefix: str
+    blob_names: list[str] | None = None
+    blob_sizes: dict[str, int] | None = None
+
 
 # Derive a sensible worker cap from available RAM.
 # Each active worker holds roughly 80 MB in-flight:
@@ -124,7 +144,7 @@ class MainWindow(QMainWindow):
         self._blob_sizes: dict[str, int] = {}
 
         # Feature 5: multi-prefix batch queue
-        self._pending_prefixes: list[str] = []
+        self._pending_prefixes: list[_PendingEntry] = []
         self._current_prefix_index: int = 0
         self._active_prefix: str = ""
 
@@ -759,7 +779,7 @@ class MainWindow(QMainWindow):
         main_prefix = self._prefix_edit.text().strip()
         extra_raw = self._batch_prefixes_edit.toPlainText().strip()
         extra_lines = [ln.strip() for ln in extra_raw.splitlines() if ln.strip()]
-        self._pending_prefixes = [main_prefix] + extra_lines
+        self._pending_prefixes = [_PendingEntry(p) for p in [main_prefix] + extra_lines]
         self._current_prefix_index = 0
         self._blob_sizes = {}
 
@@ -867,11 +887,33 @@ class MainWindow(QMainWindow):
     def _start_next_prefix(self) -> None:
         """Advance to the next prefix in the queue and start processing."""
         while self._current_prefix_index < len(self._pending_prefixes):
-            prefix = self._pending_prefixes[self._current_prefix_index]
+            entry = self._pending_prefixes[self._current_prefix_index]
+            prefix = entry.prefix
             self._active_prefix = prefix
             self._blob_sizes = {}  # fresh sizes for each new prefix
 
             batch_count = len(self._pending_prefixes)
+
+            # ------------------------------------------------------------------
+            # Scan-driven entry: exact file list already known, skip checkpoint.
+            # ------------------------------------------------------------------
+            if entry.blob_names is not None:
+                if batch_count > 1:
+                    self._log_info(
+                        f"[{self._current_prefix_index + 1}/{batch_count}] "
+                        f"Processing prefix: '{prefix}' "
+                        f"({len(entry.blob_names)} file(s) from scan)"
+                    )
+                self._start_transform(
+                    blob_names=entry.blob_names,
+                    blob_sizes=entry.blob_sizes,
+                    prefix_override=prefix,
+                )
+                return
+
+            # ------------------------------------------------------------------
+            # Normal prefix-based entry: resolve checkpoint, then start.
+            # ------------------------------------------------------------------
             if batch_count > 1:
                 self._log_info(
                     f"[{self._current_prefix_index + 1}/{batch_count}] "
@@ -885,7 +927,9 @@ class MainWindow(QMainWindow):
 
             result = self._resolve_checkpoint(container, prefix, output_prefix)
             if result is None:
-                self._log_info(f"[Checkpoint] Skipping prefix '{prefix}' — previous run was complete.")
+                self._log_info(
+                    f"[Checkpoint] Skipping prefix '{prefix}' — previous run was complete."
+                )
                 self._current_prefix_index += 1
                 continue
             checkpoint, failed_list, retry_failed = result
