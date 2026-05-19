@@ -433,3 +433,42 @@ def test_read_parquet_footer_without_known_size_calls_get_blob_properties():
 
     mock_blob_client.get_blob_properties.assert_called_once()
     assert row_count == 2
+
+
+def test_read_parquet_footer_with_sentinel_minus_one_calls_get_blob_properties():
+    """known_size=-1 (list_blobs_with_sizes sentinel for unknown size) must fall back to get_blob_properties."""
+    import io
+    from unittest.mock import MagicMock
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from parquet_transform.storage import BlobStorageClient
+
+    table = pa.table({"z": pa.array([42], type=pa.int32())})
+    buf = io.BytesIO()
+    pq.write_table(table, buf)
+    parquet_bytes = buf.getvalue()
+    file_size = len(parquet_bytes)
+
+    def fake_download(offset=0, length=None):
+        chunk = parquet_bytes[offset: offset + length] if length is not None else parquet_bytes[offset:]
+        mock_dl = MagicMock()
+        mock_dl.readall.return_value = chunk
+        return mock_dl
+
+    mock_props = MagicMock()
+    mock_props.size = file_size
+
+    mock_blob_client = MagicMock()
+    mock_blob_client.download_blob.side_effect = fake_download
+    mock_blob_client.get_blob_properties.return_value = mock_props
+
+    mock_container = MagicMock()
+    mock_container.get_blob_client.return_value = mock_blob_client
+
+    client = BlobStorageClient.__new__(BlobStorageClient)
+    client._container = mock_container
+
+    row_count, schema = client.read_parquet_footer("test.parquet", known_size=-1)
+
+    mock_blob_client.get_blob_properties.assert_called_once()
+    assert row_count == 1

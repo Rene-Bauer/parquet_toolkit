@@ -199,10 +199,11 @@ class BlobStorageClient:
         """
         blob_client = self._container.get_blob_client(blob_name)
 
+        size: int
         if known_size is not None and known_size >= 8:
             size = known_size
         else:
-            size: int = blob_client.get_blob_properties().size
+            size = blob_client.get_blob_properties().size
 
         if size < 8:
             raise RuntimeError(
