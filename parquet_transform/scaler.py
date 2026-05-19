@@ -468,7 +468,7 @@ class AdaptiveScaler:
                 step = min(headroom, max(1, min(current_workers, self._up_max_step)))
                 formula_target = min(self._bandwidth_cap, current_workers + step)
                 reason_base = f"slow-start +{step} ({measured_bw_kbs} KB/s, {headroom} slots headroom)"
-                new_count, reason = self._apply_usl_ceiling(
+                new_count, reason = self._apply_ceilings(
                     current_workers, formula_target, reason_base, measured_bw_kbs
                 )
                 if new_count > current_workers:
@@ -483,7 +483,7 @@ class AdaptiveScaler:
             step = min(headroom, self._up_max_step)
             formula_target = min(self._bandwidth_cap, current_workers + step)
             reason_base = f"{measured_bw_kbs} KB/s, {headroom} slots headroom"
-            new_count, reason = self._apply_usl_ceiling(
+            new_count, reason = self._apply_ceilings(
                 current_workers, formula_target, reason_base, measured_bw_kbs
             )
             if new_count > current_workers:
@@ -497,7 +497,7 @@ class AdaptiveScaler:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _apply_usl_ceiling(
+    def _apply_ceilings(
         self,
         current_workers: int,
         formula_target: int,
