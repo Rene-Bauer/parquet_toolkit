@@ -7,6 +7,7 @@ import csv
 import ctypes
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from time import perf_counter
 
@@ -45,7 +46,6 @@ from gui.system_monitor_worker import SystemMonitorWorker
 from gui.workers import SchemaLoaderWorker, TransformWorker, _format_bytes
 from gui.collector_panel import CollectorPanel
 from gui.zip_panel import ZipPanel
-from dataclasses import dataclass, field as _dc_field
 
 from parquet_transform import transforms as tr
 from parquet_transform.checkpoint import FailedList, RunCheckpoint
