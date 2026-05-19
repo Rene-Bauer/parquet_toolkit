@@ -600,6 +600,10 @@ class TransformWorker(QThread):
                     f"[Timing] W{worker_id} {short_name} ({duration_ms:.0f}ms total) — {timing_detail}"
                 )
 
+            if self._debug_logging and skipped and note:
+                short_name = blob_name.split("/")[-1]
+                self.log_message.emit(f"[Skip] {short_name} — {note}")
+
             self.progress.emit(completed_so_far, total, blob_name,
                                duration_ms, worker_id, skipped, note, size_bytes)
 
@@ -1080,10 +1084,20 @@ class TransformWorker(QThread):
             t2 = perf_counter()
 
             if self._should_skip_table(table):
+                skip_reason = "already in target schema"
+                if self._debug_logging:
+                    parts = []
+                    for cfg in self._col_configs:
+                        try:
+                            f = table.schema.field(cfg.name)
+                            parts.append(f"{cfg.name}:{f.type}")
+                        except Exception:
+                            parts.append(f"{cfg.name}:?")
+                    skip_reason = f"already in target schema — {', '.join(parts)}"
                 return _FileResult(
                     status="skipped",
                     duration_ms=(perf_counter() - file_start) * 1000.0,
-                    skip_reason="already in target schema",
+                    skip_reason=skip_reason,
                 )
 
             table = apply_transforms(table, self._col_configs)

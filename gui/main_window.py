@@ -45,6 +45,7 @@ from gui.system_monitor_worker import SystemMonitorWorker
 from gui.workers import SchemaLoaderWorker, TransformWorker, _format_bytes
 from gui.collector_panel import CollectorPanel
 from gui.zip_panel import ZipPanel
+from parquet_transform import transforms as tr
 from parquet_transform.checkpoint import FailedList, RunCheckpoint
 
 # Derive a sensible worker cap from available RAM.
@@ -135,6 +136,10 @@ class MainWindow(QMainWindow):
 
         # Feature 13: pause state
         self._is_paused: bool = False
+
+        # Freeze col_configs at Apply-press time so retries and batch prefixes
+        # all use exactly the same transform plan the user configured.
+        self._run_col_configs: list = []
 
         # Feature 14: log storage for filtering and export
         self._log_entries: list[tuple[str, QColor | None]] = []
@@ -627,6 +632,7 @@ class MainWindow(QMainWindow):
         if not col_configs:
             self._log_info("[Failed List] No transforms selected — nothing to do.")
             return
+        self._run_col_configs = col_configs
 
         try:
             fl = FailedList.load_or_create(container, prefix)
@@ -742,6 +748,7 @@ class MainWindow(QMainWindow):
         if not col_configs:
             self._log_info("No transforms selected — nothing to do.")
             return
+        self._run_col_configs = col_configs
 
         self._dry_run = dry_run
         self._retry_depth = 0
@@ -914,7 +921,7 @@ class MainWindow(QMainWindow):
         if self._newprefix_radio.isChecked():
             output_prefix = self._output_prefix_edit.text().strip() or None
 
-        col_configs = self._schema_table.get_column_configs()
+        col_configs = self._run_col_configs
         worker_count = self._worker_spin.value()
         max_attempts = self._attempts_spin.value()
         autoscale = self._autoscale_check.isChecked()
@@ -932,6 +939,13 @@ class MainWindow(QMainWindow):
                 f"{worker_count} worker(s){mode_str}, "
                 f"{max_attempts} attempt(s)/file..."
             )
+            if self._debug_log_check.isChecked() and col_configs:
+                _display = dict(tr.list_transforms())
+                parts = [
+                    f"{cfg.name} → {_display.get(cfg.transform, cfg.transform)}"
+                    for cfg in col_configs
+                ]
+                self._log_info(f"[Transforms] Planned: {'; '.join(parts)}")
 
         file_count_for_bar = len(blob_names) if blob_names is not None else self._file_count
         self._set_processing_state()
