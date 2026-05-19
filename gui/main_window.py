@@ -865,8 +865,8 @@ class MainWindow(QMainWindow):
             entries.append(
                 _PendingEntry(
                     prefix=r.prefix,
-                    blob_names=r.pending_blobs if r.pending_blobs is not None else None,
-                    blob_sizes=r.pending_sizes if r.pending_sizes is not None else None,
+                    blob_names=r.pending_blobs,
+                    blob_sizes=r.pending_sizes,
                 )
             )
 
