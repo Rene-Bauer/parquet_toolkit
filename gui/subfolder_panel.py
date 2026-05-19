@@ -136,6 +136,17 @@ class SubfolderPanel(QDialog):
         self._worker.log_message.connect(lambda msg: None)  # swallow; main window logs
         self._worker.error.connect(self._on_error)
 
+    def closeEvent(self, event) -> None:  # noqa: N802
+        """Disconnect worker signals before closing to prevent slots firing on a dead dialog."""
+        try:
+            self._worker.subfolder_scanned.disconnect(self._on_subfolder_scanned)
+            self._worker.progress.disconnect(self._on_progress)
+            self._worker.scan_complete.disconnect(self._on_scan_complete)
+            self._worker.error.disconnect(self._on_error)
+        except RuntimeError:
+            pass  # already disconnected
+        super().closeEvent(event)
+
     # ------------------------------------------------------------------
     # Slots
     # ------------------------------------------------------------------
@@ -275,10 +286,9 @@ class SubfolderPanel(QDialog):
 
     def _update_summary(self) -> None:
         checked = self._checked_results()
+        # pending is always a real count for stored results (red: all files, yellow: filtered, green/grey: 0)
+        # pending == -1 would only appear for mid-scan yellow placeholders, which are never stored in _results.
         total_files = sum(r.pending for r in checked if r.pending >= 0)
-        # For red subfolders pending == total (all files), for yellow pending is filtered
-        red_total = sum(r.total for r in checked if r.status == "red" and r.pending < 0)
-        total_files += red_total
         n = len(checked)
         if n == 0:
             self._summary_label.setText("No subfolders selected.")
