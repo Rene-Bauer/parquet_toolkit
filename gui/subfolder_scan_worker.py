@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import concurrent.futures
 from dataclasses import dataclass, field
+from threading import Event
 from typing import Literal
 
 import pyarrow as pa
@@ -114,10 +115,10 @@ class SubfolderScanWorker(QThread):
         self._header_prefix = header_prefix
         self._col_configs = col_configs
         self._scan_workers = max(1, scan_workers)
-        self._cancelled = False
+        self._cancel_event = Event()
 
     def cancel(self) -> None:
-        self._cancelled = True
+        self._cancel_event.set()
 
     # ------------------------------------------------------------------
     # QThread entry point
@@ -201,7 +202,7 @@ class SubfolderScanWorker(QThread):
         with concurrent.futures.ThreadPoolExecutor(max_workers=self._scan_workers) as pool:
             futs = {pool.submit(_stage1_one, arg): arg for arg in args}
             for fut in concurrent.futures.as_completed(futs):
-                if self._cancelled:
+                if self._cancel_event.is_set():
                     break
                 scanned += 1
                 result = fut.result()
@@ -211,7 +212,7 @@ class SubfolderScanWorker(QThread):
                 else:
                     self.subfolder_scanned.emit(result)
 
-        if self._cancelled:
+        if self._cancel_event.is_set():
             self.scan_complete.emit()
             return
 
@@ -227,7 +228,7 @@ class SubfolderScanWorker(QThread):
             # Cancellation is checked between subfolders, not between individual files
             # within a subfolder's deep scan. For very large subfolders this may delay
             # shutdown by the time needed to scan one subfolder's full file list.
-            if self._cancelled:
+            if self._cancel_event.is_set():
                 break
 
             c = BlobStorageClient(self._conn_str, self._container)
