@@ -480,7 +480,12 @@ def test_cpu_ceiling_adapts_to_cpu_count():
 
 
 def test_cpu_ceiling_blocks_scale_up_beyond_n_opt():
-    """Phase A ceiling must cap scale-up to N_opt even when bandwidth headroom is huge."""
+    """Phase A ceiling must cap scale-up to N_opt even when bandwidth headroom is huge.
+
+    With tightened annotation condition (cpu_n_opt < formula_target), the annotation
+    only appears when the ceiling actually reduces the target. Here, slow-start limits
+    to +2 so formula_target=4, which equals cpu_n_opt=4, so no annotation is shown.
+    """
     # cpu_count=2, 50% CPU fraction → N_opt=4
     scaler = _make_scaler(
         cpu_count=2,
@@ -497,9 +502,8 @@ def test_cpu_ceiling_blocks_scale_up_beyond_n_opt():
     # Calibrate CPU: 50% fraction → N_opt = 2/0.5 = 4
     _fill_cpu_observations(scaler, 5, cpu_ms=500.0, wall_ms=1000.0)
     new_count, reason = scaler.should_scale(2, 100_000)
+    # Must cap to ≤4 due to CPU ceiling
     assert new_count <= 4, f"Expected ≤4 but got {new_count}"
-    if new_count > 2:
-        assert "cpu" in reason.lower() or "CPU" in reason
 
 
 def test_cpu_ceiling_ignores_zero_cpu_count():

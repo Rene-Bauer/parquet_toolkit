@@ -215,7 +215,7 @@ class AdaptiveScaler:
                     med_frac = statistics.median(fractions)
                     if med_frac > 0:
                         n_opt_f = self._cpu_count / med_frac
-                        self._cpu_n_opt = int(max(2, round(n_opt_f)))
+                        self._cpu_n_opt = int(max(2, math.ceil(n_opt_f)))
 
     def get_cpu_result(self) -> tuple[float | None, int | None]:
         """Return ``(median_cpu_fraction, cpu_n_opt)`` from the latest CPU window.
@@ -531,7 +531,7 @@ class AdaptiveScaler:
                 return current_workers, ""
             effective = min(formula_target, cpu_n_opt)
             reason = formula_reason
-            if cpu_n_opt <= formula_target:
+            if cpu_n_opt < formula_target:
                 reason = (
                     f"{formula_reason} → CPU ceiling: N_opt={cpu_n_opt} "
                     f"(cores={self._cpu_count}, cpu_frac={cpu_frac:.2f})"
