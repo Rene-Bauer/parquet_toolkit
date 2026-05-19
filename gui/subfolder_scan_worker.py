@@ -28,25 +28,23 @@ from parquet_transform.transforms import get_expected_output_type
 # ---------------------------------------------------------------------------
 
 def _check_file(schema: pa.Schema, col_configs: list[ColumnConfig]) -> bool:
-    """Return True if every configured column is already at its target type.
+    """Return True if every configured column that *exists* in this file is already
+    at its target type.
 
-    Mirrors the logic of TransformWorker._should_skip_table but operates on a
-    pa.Schema directly (no full table download needed).
+    Columns configured but absent from the schema are silently skipped — a file
+    that doesn't have e.g. an Id column simply has nothing to transform for that
+    column and should be counted as done rather than queued for reprocessing.
+
+    Mirrors the logic of TransformWorker._should_skip_table.
     """
     for cfg in col_configs:
         expected = get_expected_output_type(cfg.transform)
         if expected is None:
             return False  # unknown transform → can't confirm done
         if cfg.name not in schema.names:
-            return False  # column absent → can't confirm done
-        actual_type = schema.field(cfg.name).type
-        if actual_type != expected:
+            continue  # column absent in this file → nothing to transform here
+        if schema.field(cfg.name).type != expected:
             return False
-    # When col_configs is empty, every file is trivially "done" from the scan's perspective.
-    # NOTE: this diverges from TransformWorker._should_skip_table, which returns False for
-    # empty configs (process everything). The scan entry point (_on_scan_subfolders) guards
-    # against empty configs before creating this worker, so this path is unreachable in normal
-    # use. If that guard is ever removed, callers must be aware of this difference.
     return True
 
 

@@ -99,3 +99,56 @@ def test_file_result_cpu_ms_defaults_to_zero():
     from gui.workers import _FileResult
     r = _FileResult(status="error", duration_ms=100.0)
     assert r.cpu_ms == 0.0
+
+
+import pyarrow as pa
+from parquet_transform.processor import ColumnConfig
+
+
+# ---------------------------------------------------------------------------
+# _should_skip_table — absent column semantics
+# ---------------------------------------------------------------------------
+
+def _make_skip_worker(col_configs):
+    """Minimal TransformWorker for testing _should_skip_table."""
+    return TransformWorker(
+        connection_string="",
+        container="c",
+        prefix="p/",
+        col_configs=col_configs,
+        output_prefix=None,
+        dry_run=True,
+        worker_count=1,
+    )
+
+
+def test_should_skip_absent_column_treated_as_done():
+    """A file that doesn't have a configured column should be skipped — nothing to do."""
+    col_configs = [ColumnConfig(name="Id", transform="binary16_to_uuid")]
+    worker = _make_skip_worker(col_configs)
+
+    # Table has no Id column at all
+    table = pa.table({"other": pa.array(["x", "y"], type=pa.string())})
+    assert worker._should_skip_table(table) is True
+
+
+def test_should_skip_present_wrong_type_not_skipped():
+    """File with Id at wrong type must be processed."""
+    col_configs = [ColumnConfig(name="Id", transform="binary16_to_uuid")]
+    worker = _make_skip_worker(col_configs)
+
+    table = pa.table({"Id": pa.array([b"\x00" * 16], type=pa.binary(16))})
+    assert worker._should_skip_table(table) is False
+
+
+def test_should_skip_absent_plus_present_done():
+    """Id absent (skip), ts already at target → skip the whole file."""
+    col_configs = [
+        ColumnConfig(name="Id", transform="binary16_to_uuid"),
+        ColumnConfig(name="ts", transform="timestamp_ns_to_ms_utc"),
+    ]
+    worker = _make_skip_worker(col_configs)
+
+    # Id absent; ts already at timestamp[ms, UTC]
+    table = pa.table({"ts": pa.array([1_000], type=pa.timestamp("ms", tz="UTC"))})
+    assert worker._should_skip_table(table) is True

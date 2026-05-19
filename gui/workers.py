@@ -1228,6 +1228,12 @@ class TransformWorker(QThread):
             )
 
     def _should_skip_table(self, table: pa.Table) -> bool:
+        """Return True if every configured column that *exists* in this table is already
+        at its target type.
+
+        Columns configured but absent from the table are skipped — a 2025 file without
+        an Id column doesn't need reprocessing just because Id is in the config.
+        """
         if not self._col_configs:
             return False
         schema = table.schema
@@ -1236,12 +1242,8 @@ class TransformWorker(QThread):
             if expected is None:
                 return False
             if cfg.name not in schema.names:
-                return False
-            try:
-                field = schema.field(cfg.name)
-            except KeyError:
-                return False
-            if field.type != expected:
+                continue  # column absent in this file → nothing to transform here
+            if schema.field(cfg.name).type != expected:
                 return False
         return True
 
