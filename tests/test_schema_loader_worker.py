@@ -6,7 +6,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from gui.workers import SchemaLoaderWorker
+from gui.workers import SchemaLoaderWorker, _merge_schemas
 
 
 # ---------------------------------------------------------------------------
@@ -151,3 +151,32 @@ def test_schema_loader_separates_known_and_unknown_sizes():
     assert results["count"] == 3
     assert results["total_bytes"] == 800  # 500 + 300 only
     assert results["unknown"] == ["d/b.parquet"]
+
+
+# ---------------------------------------------------------------------------
+# _merge_schemas
+# ---------------------------------------------------------------------------
+
+def test_merge_schemas_single_schema_returned_unchanged():
+    schema = pa.schema([pa.field("a", pa.int32()), pa.field("b", pa.string())])
+    result = _merge_schemas([schema])
+    assert result.equals(schema, check_metadata=False)
+
+
+def test_merge_schemas_unions_fields_across_schemas():
+    s1 = pa.schema([pa.field("ts", pa.timestamp("ms", tz="UTC")), pa.field("val", pa.int32())])
+    s2 = pa.schema([pa.field("ts", pa.timestamp("ms", tz="UTC")), pa.field("Id", pa.binary(16))])
+    result = _merge_schemas([s1, s2])
+    assert set(result.names) == {"ts", "val", "Id"}
+
+
+def test_merge_schemas_first_seen_type_wins_for_duplicate_names():
+    s1 = pa.schema([pa.field("x", pa.int32())])
+    s2 = pa.schema([pa.field("x", pa.string())])   # different type for same name
+    result = _merge_schemas([s1, s2])
+    assert result.field("x").type == pa.int32()    # s1 wins
+
+
+def test_merge_schemas_empty_list_raises_value_error():
+    with pytest.raises(ValueError, match="at least one"):
+        _merge_schemas([])

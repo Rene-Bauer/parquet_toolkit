@@ -310,6 +310,33 @@ def _upload_verify_with_retry(
     ) from last_exc
 
 
+def _merge_schemas(schemas: list[pa.Schema]) -> pa.Schema:
+    """Union a list of PyArrow schemas into one, taking first-seen type per column name.
+
+    Used by SchemaLoaderWorker to produce a combined schema from all subfolders so that
+    columns that only exist in *some* files still appear in the GUI.
+
+    Args:
+        schemas: Non-empty list of pa.Schema objects.
+
+    Returns:
+        A pa.Schema containing every field seen across all input schemas.
+        When the same field name appears in multiple schemas the type from the
+        first schema that defines it is kept (first-seen wins).
+
+    Raises:
+        ValueError: if *schemas* is empty.
+    """
+    if not schemas:
+        raise ValueError("_merge_schemas requires at least one schema")
+    seen: dict[str, pa.Field] = {}
+    for schema in schemas:
+        for field in schema:
+            if field.name not in seen:
+                seen[field.name] = field
+    return pa.schema(list(seen.values()))
+
+
 class SchemaLoaderWorker(QThread):
     schema_loaded = pyqtSignal(object, int, object, object)
     error = pyqtSignal(str)
