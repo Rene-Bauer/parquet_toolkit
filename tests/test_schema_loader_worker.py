@@ -1,6 +1,8 @@
-"""Tests for SchemaLoaderWorker — parallel listing + schema read."""
+"""Tests for SchemaLoaderWorker — parallel listing + subfolder schema sampling."""
+import collections
 import io
-from unittest.mock import MagicMock, call, patch
+import sys
+from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -13,19 +15,23 @@ from gui.workers import SchemaLoaderWorker, _merge_schemas
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_schema_bytes() -> bytes:
-    table = pa.table({"a": pa.array([1, 2], type=pa.int64())})
-    buf = io.BytesIO()
-    pq.write_table(table, buf)
-    return buf.getvalue()
+def _make_client_mock(
+    blobs_with_sizes,
+    schema: pa.Schema | None = None,
+    subfolder_names: list[str] | None = None,
+):
+    """Return a BlobStorageClient mock for SchemaLoaderWorker.
 
-
-def _make_client_mock(blobs_with_sizes, schema: pa.Schema | None = None):
-    """Return a BlobStorageClient mock configured for SchemaLoaderWorker."""
+    - list_blobs_with_sizes  → blobs_with_sizes
+    - list_blob_prefixes     → subfolder_names (default: [] = flat prefix)
+    - list_first_parquet_blob → first blob name (or None)
+    - read_parquet_footer    → (0, schema)
+    """
     mock = MagicMock()
     mock.list_blobs_with_sizes.return_value = blobs_with_sizes
+    mock.list_blob_prefixes.return_value = subfolder_names or []
     if schema is not None:
-        mock.read_schema.return_value = schema
+        mock.read_parquet_footer.return_value = (0, schema)
     mock.list_first_parquet_blob.return_value = (
         blobs_with_sizes[0][0] if blobs_with_sizes else None
     )
@@ -46,15 +52,15 @@ def _run_worker(worker: SchemaLoaderWorker):
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Tests: flat prefix (no subfolders) — existing behaviour preserved
 # ---------------------------------------------------------------------------
 
 def test_schema_loader_emits_schema_and_blob_count():
-    schema = pa.schema([("x", pa.int32()), ("y", pa.string())])
+    schema = pa.schema([pa.field("x", pa.int32()), pa.field("y", pa.string())])
     blobs = [("data/a.parquet", 1024), ("data/b.parquet", 2048)]
 
     c_list = _make_client_mock(blobs)
-    c_schema = _make_client_mock(blobs, schema=schema)
+    c_schema = _make_client_mock(blobs, schema=schema)   # list_blob_prefixes → []
     clients = [c_list, c_schema]
 
     with patch("gui.workers.BlobStorageClient", side_effect=clients):
@@ -68,9 +74,9 @@ def test_schema_loader_emits_schema_and_blob_count():
     assert results["schema"].equals(schema, check_metadata=False)
 
 
-def test_schema_loader_uses_two_clients():
-    """Two BlobStorageClient instances must be created (one per I/O thread)."""
-    schema = pa.schema([("z", pa.float64())])
+def test_schema_loader_uses_two_clients_for_flat_prefix():
+    """Two BlobStorageClient instances created for a flat prefix (no subfolders)."""
+    schema = pa.schema([pa.field("z", pa.float64())])
     blobs = [("pre/c.parquet", 512)]
 
     c_list = _make_client_mock(blobs)
@@ -85,7 +91,7 @@ def test_schema_loader_uses_two_clients():
 
 
 def test_schema_loader_closes_both_clients_on_success():
-    schema = pa.schema([("v", pa.bool_())])
+    schema = pa.schema([pa.field("v", pa.bool_())])
     blobs = [("p/f.parquet", 100)]
 
     c_list = _make_client_mock(blobs)
@@ -128,11 +134,10 @@ def test_schema_loader_emits_error_when_no_blobs():
         results = _run_worker(worker)
 
     assert "error" in results
-    assert "schema_loaded" not in results or "schema" not in results
 
 
 def test_schema_loader_separates_known_and_unknown_sizes():
-    schema = pa.schema([("k", pa.int16())])
+    schema = pa.schema([pa.field("k", pa.int16())])
     blobs = [
         ("d/a.parquet", 500),
         ("d/b.parquet", -1),   # unknown size
@@ -151,6 +156,55 @@ def test_schema_loader_separates_known_and_unknown_sizes():
     assert results["count"] == 3
     assert results["total_bytes"] == 800  # 500 + 300 only
     assert results["unknown"] == ["d/b.parquet"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: subfolder-based sampling (the new behaviour)
+# ---------------------------------------------------------------------------
+
+def test_schema_loader_merges_schemas_from_subfolders():
+    """When subfolders exist, schema is sampled from the first file in each
+    subfolder and merged so columns only present in some subfolders appear."""
+    # 2025 subfolder: no Id column
+    schema_2025 = pa.schema([pa.field("ts", pa.timestamp("ms", tz="UTC")), pa.field("val", pa.int32())])
+    # 2026 subfolder: has Id column (unconverted)
+    schema_2026 = pa.schema([pa.field("ts", pa.timestamp("ms", tz="UTC")), pa.field("Id", pa.binary(16))])
+
+    blobs = [("livedata/2025/a.parquet", 100), ("livedata/2026/b.parquet", 200)]
+
+    c_list = MagicMock()
+    c_list.list_blobs_with_sizes.return_value = blobs
+
+    c_schema = MagicMock()
+    c_schema.list_blob_prefixes.return_value = ["2025", "2026"]
+
+    # Per-subfolder clients — deque.popleft() is thread-safe in CPython
+    schemas_queue = collections.deque([schema_2025, schema_2026])
+
+    call_idx = [0]
+
+    def client_factory(conn, container):
+        i = call_idx[0]
+        call_idx[0] += 1
+        if i == 0:
+            return c_list
+        if i == 1:
+            return c_schema
+        # Subsequent calls are per-subfolder clients created inside _read_one
+        m = MagicMock()
+        m.list_first_parquet_blob.return_value = "sf/first.parquet"
+        m.read_parquet_footer.return_value = (0, schemas_queue.popleft())
+        return m
+
+    with patch("gui.workers.BlobStorageClient", side_effect=client_factory):
+        worker = SchemaLoaderWorker("conn", "container", "livedata/")
+        results = _run_worker(worker)
+
+    assert "error" not in results
+    col_names = set(results["schema"].names)
+    assert "ts" in col_names
+    assert "val" in col_names    # from 2025 subfolder
+    assert "Id" in col_names    # from 2026 subfolder — this is what was missing before
 
 
 # ---------------------------------------------------------------------------

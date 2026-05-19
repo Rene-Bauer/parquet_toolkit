@@ -354,12 +354,53 @@ class SchemaLoaderWorker(QThread):
             c_schema = BlobStorageClient(self._connection_string, self._container)
 
             def _fetch_schema() -> pa.Schema:
-                first = c_schema.list_first_parquet_blob(self._prefix)
-                if first is None:
-                    raise RuntimeError(
-                        f"No .parquet files found under prefix '{self._prefix}'."
+                subfolder_names = c_schema.list_blob_prefixes(self._prefix)
+
+                if not subfolder_names:
+                    # Flat prefix (no virtual subdirectories): read the first file only.
+                    first = c_schema.list_first_parquet_blob(self._prefix)
+                    if first is None:
+                        raise RuntimeError(
+                            f"No .parquet files found under prefix '{self._prefix}'."
+                        )
+                    _, schema = c_schema.read_parquet_footer(first)
+                    return schema
+
+                # Subfolder-based sampling: read the first file from each subfolder in
+                # parallel using one BlobStorageClient per thread (same pattern as
+                # SubfolderScanWorker) so the HTTP sessions don't race.
+                norm = (
+                    (self._prefix.rstrip("/") + "/")
+                    if self._prefix.strip("/")
+                    else ""
+                )
+
+                def _read_one(name: str) -> pa.Schema | None:
+                    sf_client = BlobStorageClient(
+                        self._connection_string, self._container
                     )
-                return c_schema.read_schema(first)
+                    try:
+                        first = sf_client.list_first_parquet_blob(f"{norm}{name}")
+                        if first is None:
+                            return None
+                        _, sub_schema = sf_client.read_parquet_footer(first)
+                        return sub_schema
+                    except Exception:
+                        return None
+                    finally:
+                        sf_client.close()
+
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(16, len(subfolder_names))
+                ) as sub_pool:
+                    results = list(sub_pool.map(_read_one, subfolder_names))
+
+                schemas = [s for s in results if s is not None]
+                if not schemas:
+                    raise RuntimeError(
+                        f"No readable .parquet files found under prefix '{self._prefix}'."
+                    )
+                return _merge_schemas(schemas)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 fut_blobs = pool.submit(c_list.list_blobs_with_sizes, self._prefix)
@@ -369,11 +410,13 @@ class SchemaLoaderWorker(QThread):
             schema = fut_schema.result()
 
             if not blobs:
-                self.error.emit(f"No .parquet files found under prefix '{self._prefix}'.")
+                self.error.emit(
+                    f"No .parquet files found under prefix '{self._prefix}'."
+                )
                 return
 
-            known   = [(n, s) for n, s in blobs if s >= 0]
-            unknown = [n      for n, s in blobs if s <  0]
+            known = [(n, s) for n, s in blobs if s >= 0]
+            unknown = [n for n, s in blobs if s < 0]
             total_bytes = sum(s for _, s in known)
             self.schema_loaded.emit(schema, len(blobs), total_bytes, unknown)
         except Exception as exc:
