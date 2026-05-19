@@ -258,6 +258,12 @@ class MainWindow(QMainWindow):
         self._load_btn = QPushButton("Load Schema")
         self._load_btn.setFixedWidth(110)
         self._load_btn.clicked.connect(self._on_load_schema)
+        self._scan_btn = QPushButton("Scan Subfolders…")
+        self._scan_btn.setToolTip(
+            "List all subfolders and scan their schemas to find which need transformation"
+        )
+        self._scan_btn.setEnabled(False)
+        self._scan_btn.clicked.connect(self._on_scan_subfolders)
         cp_row.addWidget(container_label)
         cp_row.addWidget(self._container_edit)
         cp_row.addSpacing(16)
@@ -265,6 +271,8 @@ class MainWindow(QMainWindow):
         cp_row.addWidget(self._prefix_edit)
         cp_row.addSpacing(8)
         cp_row.addWidget(self._load_btn)
+        cp_row.addSpacing(4)
+        cp_row.addWidget(self._scan_btn)
         layout.addLayout(cp_row)
 
         # Feature 5: additional batch prefixes
@@ -387,13 +395,6 @@ class MainWindow(QMainWindow):
         self._apply_btn.setFixedWidth(150)
         self._apply_btn.clicked.connect(lambda: self._on_apply(dry_run=False))
 
-        self._scan_btn = QPushButton("Scan Subfolders…")
-        self._scan_btn.setToolTip(
-            "List all subfolders and scan their schemas to find which need transformation"
-        )
-        self._scan_btn.setEnabled(False)
-        self._scan_btn.clicked.connect(self._on_scan_subfolders)
-
         # Feature 13: Pause / Resume
         self._pause_btn = QPushButton("Pause")
         self._pause_btn.setFixedWidth(80)
@@ -419,7 +420,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._clear_cp_btn)
         layout.addStretch()
         layout.addWidget(self._apply_btn)
-        layout.addWidget(self._scan_btn)
         layout.addWidget(self._pause_btn)
         layout.addWidget(self._cancel_btn)
         return widget
@@ -453,6 +453,11 @@ class MainWindow(QMainWindow):
         btn_corrupted.setFixedWidth(70)
         btn_corrupted.clicked.connect(lambda: self._set_log_filter("CORRUPTED"))
 
+        btn_transformed = QPushButton("Transformed")
+        btn_transformed.setFixedWidth(85)
+        btn_transformed.setToolTip("Show only successfully transformed files")
+        btn_transformed.clicked.connect(lambda: self._set_log_filter("| OK"))
+
         # Feature 2: log export
         btn_export_log = QPushButton("Export Log…")
         btn_export_log.setFixedWidth(95)
@@ -472,6 +477,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(btn_failed)
         toolbar.addWidget(btn_skipped)
         toolbar.addWidget(btn_corrupted)
+        toolbar.addWidget(btn_transformed)
         toolbar.addStretch()
         toolbar.addWidget(btn_export_log)
         toolbar.addWidget(btn_export_csv)
@@ -1233,7 +1239,7 @@ class MainWindow(QMainWindow):
             reason = note or "already in target schema"
             self._log_info(f"{base} | SKIPPED ({reason})")
         else:
-            self._log_info(base)
+            self._log_info(f"{base} | OK")
 
     def _on_file_error(self, blob_name: str, tb: str) -> None:
         self._log_error(f"  FAILED: {blob_name}\n{tb.strip()}")
