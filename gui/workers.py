@@ -545,6 +545,7 @@ class TransformWorker(QThread):
         self._pending_force_scale = False
         self._real_work_started = False
         if self._autoscale and not self._dry_run:
+            _cpu_count = _psutil.cpu_count(logical=True) if _psutil is not None else None
             scaler = AdaptiveScaler(
                 window_size=SCALER_WINDOW_SIZE,
                 min_samples=SCALER_MIN_SAMPLES,
@@ -563,7 +564,7 @@ class TransformWorker(QThread):
                 usl_min_levels=SCALER_USL_MIN_LEVELS,
                 usl_min_samples_per_level=SCALER_USL_MIN_SAMPLES_PER_LEVEL,
                 usl_agree_tolerance=SCALER_USL_AGREE_TOLERANCE,
-                cpu_count=_psutil.cpu_count(logical=True) if _psutil is not None else None,
+                cpu_count=_cpu_count,
                 cpu_window_size=SCALER_CPU_WINDOW_SIZE,
                 cpu_min_samples=SCALER_CPU_MIN_SAMPLES,
             )
@@ -1046,7 +1047,7 @@ class TransformWorker(QThread):
                 f"[CPU] Phase A active — "
                 f"cpu_frac={cpu_frac:.2f} ({cpu_frac * 100:.0f}% CPU-bound) "
                 f"→ N_opt={cpu_n_opt} workers "
-                f"(cores={_psutil.cpu_count(logical=True) if _psutil is not None else '?'})"
+                f"(cores={_psutil.cpu_count(logical=True) or '?' if _psutil is not None else '?'})"
             )
 
         # Log and signal whenever the effective bandwidth ceiling changes (grows or shrinks)
@@ -2040,6 +2041,8 @@ class ZipConverterWorker(QThread):
                 usl_min_levels=SCALER_USL_MIN_LEVELS,
                 usl_min_samples_per_level=SCALER_USL_MIN_SAMPLES_PER_LEVEL,
                 usl_agree_tolerance=SCALER_USL_AGREE_TOLERANCE,
+                # Phase A wired for forward compatibility; record_cpu_observation is not called
+                # here because _process_zip_once does not yet measure per-step CPU time.
                 cpu_count=_psutil.cpu_count(logical=True) if _psutil is not None else None,
                 cpu_window_size=SCALER_CPU_WINDOW_SIZE,
                 cpu_min_samples=SCALER_CPU_MIN_SAMPLES,
