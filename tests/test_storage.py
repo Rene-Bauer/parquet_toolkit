@@ -353,3 +353,83 @@ def test_list_zip_blobs_with_sizes_empty_prefix():
 
     result = client.list_zip_blobs_with_sizes("noblobs/")
     assert result == []
+
+
+# ---------------------------------------------------------------------------
+# read_parquet_footer — known_size parameter
+# ---------------------------------------------------------------------------
+
+def test_read_parquet_footer_with_known_size_skips_get_blob_properties():
+    """When known_size >= 8 is provided, get_blob_properties is never called."""
+    import io
+    from unittest.mock import MagicMock
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from parquet_transform.storage import BlobStorageClient
+
+    # Build a real minimal Parquet file in memory so the footer parse succeeds.
+    table = pa.table({"x": pa.array([1, 2, 3], type=pa.int64())})
+    buf = io.BytesIO()
+    pq.write_table(table, buf)
+    parquet_bytes = buf.getvalue()
+    file_size = len(parquet_bytes)
+
+    def fake_download(offset=0, length=None):
+        chunk = parquet_bytes[offset: offset + length] if length is not None else parquet_bytes[offset:]
+        mock_dl = MagicMock()
+        mock_dl.readall.return_value = chunk
+        return mock_dl
+
+    mock_blob_client = MagicMock()
+    mock_blob_client.download_blob.side_effect = fake_download
+
+    mock_container = MagicMock()
+    mock_container.get_blob_client.return_value = mock_blob_client
+
+    client = BlobStorageClient.__new__(BlobStorageClient)
+    client._container = mock_container
+
+    row_count, schema = client.read_parquet_footer("test.parquet", known_size=file_size)
+
+    mock_blob_client.get_blob_properties.assert_not_called()
+    assert row_count == 3
+    assert schema.field("x").type == pa.int64()
+
+
+def test_read_parquet_footer_without_known_size_calls_get_blob_properties():
+    """When known_size is omitted, get_blob_properties is called to learn the size."""
+    import io
+    from unittest.mock import MagicMock
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from parquet_transform.storage import BlobStorageClient
+
+    table = pa.table({"y": pa.array(["a", "b"])})
+    buf = io.BytesIO()
+    pq.write_table(table, buf)
+    parquet_bytes = buf.getvalue()
+    file_size = len(parquet_bytes)
+
+    def fake_download(offset=0, length=None):
+        chunk = parquet_bytes[offset: offset + length] if length is not None else parquet_bytes[offset:]
+        mock_dl = MagicMock()
+        mock_dl.readall.return_value = chunk
+        return mock_dl
+
+    mock_props = MagicMock()
+    mock_props.size = file_size
+
+    mock_blob_client = MagicMock()
+    mock_blob_client.download_blob.side_effect = fake_download
+    mock_blob_client.get_blob_properties.return_value = mock_props
+
+    mock_container = MagicMock()
+    mock_container.get_blob_client.return_value = mock_blob_client
+
+    client = BlobStorageClient.__new__(BlobStorageClient)
+    client._container = mock_container
+
+    row_count, schema = client.read_parquet_footer("test.parquet")
+
+    mock_blob_client.get_blob_properties.assert_called_once()
+    assert row_count == 2

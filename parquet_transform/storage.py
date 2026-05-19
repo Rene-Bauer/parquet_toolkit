@@ -182,17 +182,28 @@ class BlobStorageClient:
         buf = io.BytesIO(raw)
         return pq.read_schema(buf)
 
-    def read_parquet_footer(self, blob_name: str) -> tuple[int, pa.Schema]:
+    def read_parquet_footer(
+        self, blob_name: str, known_size: int | None = None
+    ) -> tuple[int, pa.Schema]:
         """Read row count and Arrow schema from a blob's Parquet footer.
 
         Uses two Azure range-download requests (total: footer_size + 8 bytes),
         so this is efficient regardless of the blob's full size.
 
+        If *known_size* is provided (e.g. from a prior list_blobs_with_sizes call)
+        and is a valid positive integer >= 8, the get_blob_properties() round-trip
+        is skipped, reducing the request count from 3 to 2.
+
         Raises RuntimeError if the blob is not a valid Parquet file or if
         the footer cannot be parsed.
         """
         blob_client = self._container.get_blob_client(blob_name)
-        size: int = blob_client.get_blob_properties().size
+
+        if known_size is not None and known_size >= 8:
+            size = known_size
+        else:
+            size: int = blob_client.get_blob_properties().size
+
         if size < 8:
             raise RuntimeError(
                 f"Blob {blob_name!r} is too small to be a Parquet file ({size} bytes)"
